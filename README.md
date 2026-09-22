@@ -107,8 +107,11 @@ curl -s http://127.0.0.1:8030/metrics | grep jev_shadow
 ## The Laya System-1 Tier (GPU2)
 
 `deploy/gpu2_laya_service.py` exposes Laya over HTTP on `:8031`; the gateway calls it
-inline inside `core/router.py`. It never imports PyTorch itself — a slow or dead GPU
-must not endanger the Pi's routing loop.
+from `core/router.py`. It never imports PyTorch itself — a slow or dead GPU must not
+endanger the Pi's routing loop — and the tier is **advisory only**: it holds no authority
+over retrieval, over command execution, or over the subject domain. The classifier is
+*started* concurrently with the local index lookup and awaited only if the local path
+cannot answer on its own.
 
 ```bash
 # on GPU2
@@ -154,6 +157,33 @@ Read this honestly:
   (several retrieval-strategy labels are arguable). Treat it as a smoke test, not a verdict.
 - Adding the preset block cost ~12 ms of inference (27.6 → 39 ms average across mixed
   checkpoints); it is still one forward pass, just more head tokens.
+
+### Keeping it off the blocking path
+
+Measured with `scripts/measure_route_latency.py` against a live GPU2:
+
+| query shape | `route()` p50 before | after |
+| --- | --- | --- |
+| answerable from the local FTS index | 55.98 ms | **0.16 ms** |
+| no local hit | 55.62 ms | 56.40 ms |
+
+In the first row, 55.34 ms of the 55.98 ms was the GPU2 round trip, and the answer that came
+back never used the verdict — the local index answers itself in ~0.6 ms. On the fall-through
+path the classifier now also overlaps the embedding call instead of serialising in front of it
+(checked with a 120 ms embedding stub: 123.9 ms total, not 184 ms).
+
+Two things had to be fixed after the first attempt, both found by measuring:
+
+- **Abandoned calls are not free.** Left running fire-and-forget, the requests nobody would read
+  queued ahead of the requests that *did* need a verdict on GPU2's single-stream service: the
+  fall-through path went from 55.6 ms to 120.4 ms p50, with half its calls timing out. The task
+  is now cancelled as soon as the local path answers. Enrichment for such queries is what shadow
+  mode is for.
+- **Raising the confidence threshold would not have fixed the confident-wrong answers.** The
+  service reported `confidence` as the minimum over our two hand-written questions — the
+  out-of-distribution taxonomy — and the wrong answer was the confident one (0.9995). The
+  threshold now gates the shipped preset `task` signal only; the invented labels are recorded
+  for analysis and no longer consulted.
 
 ### Why our own taxonomy had to be replaced
 
@@ -201,8 +231,8 @@ Important variables:
 - `JEV_LLM_HOST` and `JEV_LLM_MODEL` - Ollama-compatible generation endpoint and model.
 - `JEV_EMBEDDING_API` and `JEV_EMBEDDING_MODEL` - embedding endpoint/model for vector search.
 - `JEV_LAYA_URL` - optional remote Laya classifier endpoint.
-- `JEV_LAYA_TIMEOUT_S` - call budget for that classifier; also the worst-case latency it can add, since the call is inline in the routing path.
-- `JEV_LAYA_CONFIDENCE_THRESHOLD` - confidence a Laya verdict must reach before it may change routing.
+- `JEV_LAYA_TIMEOUT_S` - total budget for that classifier, enforced with `asyncio.timeout`. Locally answered queries never await it; this bounds what it can add to a fall-through.
+- `JEV_LAYA_CONFIDENCE_THRESHOLD` - confidence the shipped preset `task` signal must reach before a verdict counts as accepted. It does not gate the hand-written `strategy`/`domain` questions.
 - `JEV_DECISION_ENGINE_URL` - optional llama.cpp-style `/v1/decision` endpoint.
 - `JEV_SHADOW_MODE` - `off` (default), `laya`, or `decision`; what to probe in the background.
 - `JEV_SHADOW_URL`, `JEV_SHADOW_TIMEOUT_S`, `JEV_SHADOW_MAX_INFLIGHT`, `JEV_SHADOW_SAMPLE_RATE` - shadow probe controls.
@@ -235,8 +265,10 @@ The router rejects stale vector indexes when the embedding model or vector dimen
 - `jev_decisions.jsonl` - privacy-preserving decision log using query hashes by default; shadow observations are appended as `{"event": "shadow", ...}`.
 
 Each routing event also records `execution.laya_accepted`, i.e. whether the System-1 verdict
-would have cleared `JEV_LAYA_CONFIDENCE_THRESHOLD`. That counter is what tells you whether the
-threshold is calibrated rather than merely strict.
+would have cleared `JEV_LAYA_CONFIDENCE_THRESHOLD`, and `/stats` reports `laya_not_awaited` for
+requests the local path answered without waiting for the classifier. A high `laya_not_awaited`
+beside a low `laya_accepted` is the shape to want: the classifier is not earning its latency on
+that traffic.
 
 ## Benchmarking the Laya tier
 
