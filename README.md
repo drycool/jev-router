@@ -371,6 +371,29 @@ default is on because the corpus here is a public car manual; set it to `false` 
 signals without content. The length stays either way: it is a signal about the answer, not
 the answer itself.
 
+### Labelling
+
+The person who owns the labels gets a queue, not a JSON body to hand-write:
+
+```bash
+python3 scripts/label.py              # interactive: [a]ccepted [r]ejected [p]artial [s]kip [q]uit
+python3 scripts/label.py --list 20    # just show what is awaiting a verdict
+python3 scripts/label.py --id <decision_id> --verdict rejected --comment "..." --query "..." --source human
+```
+
+Skipping is a first-class option: a guessed label is worse than a missing one, because it
+looks like data. The queue never offers a decision that already has a verdict, and it never
+offers a v1 record — those have no `decision_id`, so a verdict could not attach to one.
+
+`--query` is worth using. The decision log keeps only a **hash** of the query, so it shows what
+was answered but not what was asked, and nobody can judge an answer's correctness without the
+question. The reviewer has it in hand at the moment of judging, so attaching it there makes the
+label self-contained without turning on raw-query logging. The report counts these separately:
+
+```
+  labels carrying their question       3 / 3
+```
+
 ### Is there enough to act on?
 
 ```bash

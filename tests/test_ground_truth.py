@@ -177,16 +177,41 @@ class TestDecisionRecordShape(unittest.TestCase):
 
 
 class TestFeedbackEndpoint(unittest.TestCase):
-    def verdict(self, decision_id="e" * 32, verdict="accepted", source="human", comment=""):
+    def verdict(self, decision_id="e" * 32, verdict="accepted", source="human", comment="", query=""):
         with CapturedLogs(server.feedback_logger) as captured:
             response = asyncio.run(
                 server.feedback(
                     server.FeedbackRequest(
-                        decision_id=decision_id, verdict=verdict, source=source, comment=comment
+                        decision_id=decision_id,
+                        verdict=verdict,
+                        source=source,
+                        comment=comment,
+                        query=query,
                     )
                 )
             )
         return response, captured.events()
+
+    def test_the_reviewer_can_attach_the_question_they_judged(self):
+        """The decision log keeps only a hash of the query, so a label without the question
+        cannot be re-judged by anyone else. The reviewer has it in hand at the moment of
+        judging, and this is the only point at which it can be captured without turning on
+        raw-query logging globally."""
+        _, events = self.verdict(query="какой момент затяжки болтов головки блока цилиндров")
+        self.assertEqual(events[0]["query"], "какой момент затяжки болтов головки блока цилиндров")
+
+    def test_an_absent_question_is_null_rather_than_missing(self):
+        """A stable shape lets a reader tell 'the reviewer did not provide the question' from
+        'this field did not exist yet'."""
+        _, events = self.verdict()
+        self.assertIn("query", events[0])
+        self.assertIsNone(events[0]["query"])
+
+    def test_an_absurdly_long_question_is_rejected(self):
+        with self.assertRaises(Exception):
+            server.FeedbackRequest(
+                decision_id="a" * 32, verdict="accepted", query="я" * 4001
+            )
 
     def test_a_verdict_is_appended_not_merged_into_the_decision_log(self):
         response, events = self.verdict()

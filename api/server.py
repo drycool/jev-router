@@ -323,6 +323,13 @@ class FeedbackRequest(BaseModel):
     verdict: Literal["accepted", "rejected", "partial"]
     source: Literal["human", "agent", "script"] = "agent"
     comment: str = Field(default="", max_length=2000)
+    # Optional, and the reason it is here: the decision log stores only a hash of the query
+    # (JEV_LOG_RAW_QUERY defaults to false), so a reader can see what was answered but not
+    # what was asked - and nobody can judge an answer's correctness without the question.
+    # The reviewer holds the question at the moment they judge, so letting them attach it
+    # per verdict keeps raw text out of the log by default while making the label
+    # self-contained for whoever reads the dataset later.
+    query: str = Field(default="", max_length=4000)
 
 
 class FeedbackResponse(BaseModel):
@@ -665,6 +672,9 @@ async def feedback(req: FeedbackRequest):
         "source": req.source,
         "known_decision": known,
         "previous_verdict": previous_verdict,
+        # Null rather than absent when not supplied: a stable shape means a reader can tell
+        # "the reviewer did not provide the question" from "this field did not exist yet".
+        "query": req.query or None,
         "comment": req.comment,
     }
     feedback_logger.info(json.dumps(event, ensure_ascii=False))

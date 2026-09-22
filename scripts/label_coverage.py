@@ -83,6 +83,20 @@ class Decision:
         ruling = self.ruling_verdict
         return (ruling or {}).get("comment", "") or ""
 
+    @property
+    def labelled_query(self) -> str:
+        """The question, if whoever judged attached it.
+
+        The decision log holds only a hash of the query, so an answer preview alone cannot be
+        judged: the reader can see what was answered but not what was asked. A label that
+        carries its question is self-contained and can be reviewed later without the person
+        who made it; one that does not is only as good as the reviewer's memory.
+        """
+        for verdict in reversed(self.verdicts):
+            if verdict.get("query"):
+                return verdict["query"]
+        return ""
+
 
 def read_jsonl(path: str) -> list[dict]:
     """Read a JSONL file, skipping malformed lines instead of dying on them.
@@ -142,6 +156,7 @@ def attach_feedback(decisions: list[Decision], path: str) -> tuple[int, int]:
             "verdict": entry.get("verdict"),
             "source": entry.get("source", "agent"),
             "comment": entry.get("comment", ""),
+            "query": entry.get("query") or "",
             "timestamp": entry.get("timestamp", ""),
             "index": index,
         }
@@ -181,6 +196,7 @@ def report(decisions: list[Decision], attached: int, orphans: int, min_per_class
 
     coverage = (len(labelled) / len(decisions) * 100) if decisions else 0.0
     thin = {name: count for name, count in verdicts.items() if count < min_per_class}
+    self_contained = [d for d in labelled if d.labelled_query]
 
     return {
         "decisions": len(decisions),
@@ -195,6 +211,7 @@ def report(decisions: list[Decision], attached: int, orphans: int, min_per_class
         "by_tier": {tier: dict(counts) for tier, counts in sorted(by_tier.items())},
         "judged_by_both": len(both),
         "source_disagreements": len(disagreements),
+        "labels_with_query": len(self_contained),
         "thin_classes": thin,
         "min_per_class": min_per_class,
         "labelled_examples": [
@@ -204,6 +221,7 @@ def report(decisions: list[Decision], attached: int, orphans: int, min_per_class
                 "strategy": d.strategy,
                 "verdict": d.effective_verdict,
                 "comment": d.effective_comment,
+                "query": d.labelled_query,
                 "preview": d.preview,
             }
             for d in labelled
@@ -238,6 +256,12 @@ def print_report(data: dict[str, Any], decisions: list[Decision], show_rejected:
         print("  (no overlap yet, so cheap agent labels are unvalidated - they cannot be")
         print("   trusted as a substitute for human ones until some overlap exists)")
 
+    if data["labelled"]:
+        print(f"  labels carrying their question       {data['labels_with_query']} / {data['labelled']}")
+        if data["labels_with_query"] == 0:
+            print("  (the decision log keeps only a query hash, so a label without the question")
+            print("   cannot be re-judged by anyone else - pass query= when recording a verdict)")
+
     print("\ndataset readiness")
     if not data["decisions"]:
         print("  No decisions logged. Nothing is calling the router yet, so there is")
@@ -269,6 +293,10 @@ def print_report(data: dict[str, Any], decisions: list[Decision], show_rejected:
         for decision in shown:
             comment = decision.effective_comment
             print(f"  [{decision.tier} {decision.strategy}] {decision.decision_id[:12]}")
+            if decision.labelled_query:
+                print(f"    question: {decision.labelled_query}")
+            else:
+                print("    question: (not recorded at labelling time)")
             if comment:
                 print(f"    reason: {comment}")
             if decision.preview:
