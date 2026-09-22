@@ -8,6 +8,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from api import server
+from core.decision_engine import DecisionEngineClient, DecisionEngineResult
 from core.router import (
     AgentExecutor,
     AgentType,
@@ -167,6 +168,10 @@ class RouterTests(unittest.TestCase):
             "agent_errors",
             "laya_predictions",
             "laya_accepted",
+            "decision_engine_requests",
+            "decision_engine_errors",
+            "decision_engine_low_confidence",
+            "decision_engine_latency_ms",
         ):
             self.assertIn(key, payload)
 
@@ -186,3 +191,40 @@ class RouterTests(unittest.TestCase):
             response = client.get("/route-only", params={"query": "Raspberry Pi cable"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["extracted_metadata"]["domain"], "raspberry_pi")
+
+    def test_decision_engine_falls_back_when_unavailable(self):
+        client = DecisionEngineClient(base_url="http://127.0.0.1:1", timeout_s=0.01)
+        result = asyncio.run(client.decide("route this", ["graph_lightrag", "general_llm"]))
+        self.assertEqual(result.choice, "graph_lightrag")
+        self.assertEqual(result.engine, "fallback")
+        self.assertNotEqual(result.status, "success")
+        self.assertTrue(result.low_confidence)
+
+    def test_decision_test_endpoint_records_fallback_metrics(self):
+        class Engine:
+            async def decide(self, **_):
+                return DecisionEngineResult(
+                    choice="graph_lightrag",
+                    confidence=0.0,
+                    latency_ms=1.5,
+                    status="timeout",
+                    error="decision timeout",
+                )
+
+        before = server._stats["decision_engine_requests"]
+        with patch.object(server, "decision_engine", Engine()):
+            client = TestClient(server.app)
+            response = client.post(
+                "/decision-test",
+                json={
+                    "query": "choose path",
+                    "candidates": ["graph_lightrag", "general_llm"],
+                    "schema": "routing_v1",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["choice"], "graph_lightrag")
+        self.assertEqual(payload["status"], "timeout")
+        self.assertEqual(payload["fallback_reason"], "decision timeout")
+        self.assertEqual(server._stats["decision_engine_requests"], before + 1)

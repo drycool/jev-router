@@ -22,7 +22,7 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: Compile modules
-        run: python -m py_compile core/router.py api/server.py scripts/build_vector_index.py deploy/gpu2_laya_service.py tests/test_router.py
+        run: python -m py_compile core/router.py core/decision_engine.py api/server.py scripts/build_vector_index.py deploy/gpu2_laya_service.py tests/test_router.py
 
       - name: Run tests
         run: python -m unittest discover -v

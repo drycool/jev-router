@@ -17,6 +17,7 @@ Core components:
 
 - `core/router.py` - routing pipeline, FTS5/vector retrieval, LightRAG fallback handling.
 - `core/laya_client.py` - optional remote Laya/System-1 classifier client with strict timeout.
+- `core/decision_engine.py` - optional llama.cpp-style decision endpoint client.
 - `agents/base.py` - general, code, DB, and troubleshooting agents.
 - `api/server.py` - FastAPI service and observability endpoints.
 - `scripts/build_vector_index.py` - builds the optional `.npz` vector index from LightRAG chunks.
@@ -30,6 +31,7 @@ Core components:
 - LightRAG timeout handling with degraded-mode fallback to local context.
 - JSONL decision logging for future evaluation or router distillation.
 - Prometheus-compatible `/metrics` endpoint.
+- Diagnostic `/decision-test` endpoint for evaluating a llama.cpp-style decision layer without changing production routing.
 - Regression tests for routing, fallback, vector-index validation, and API diagnostics.
 
 ## Quick Start
@@ -63,6 +65,16 @@ curl -X POST http://127.0.0.1:8030/query \
   -d '{"query":"Какие кабели обсуждались для Raspberry Pi 5?","execute":true}'
 ```
 
+Decision-engine diagnostic probe:
+
+```bash
+curl -X POST http://127.0.0.1:8030/decision-test \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Which retrieval path should handle this?","candidates":["exact_fts","vector_fast","graph_lightrag"],"schema":"routing_v1"}'
+```
+
+This endpoint is intentionally diagnostic: it records metrics and fallback behavior, but it does not alter `/query` routing.
+
 ## Configuration
 
 All runtime configuration is environment-based. Start from `.env.example`.
@@ -74,6 +86,7 @@ Important variables:
 - `JEV_LLM_HOST` and `JEV_LLM_MODEL` - Ollama-compatible generation endpoint and model.
 - `JEV_EMBEDDING_API` and `JEV_EMBEDDING_MODEL` - embedding endpoint/model for vector search.
 - `JEV_LAYA_URL` - optional remote Laya classifier endpoint.
+- `JEV_DECISION_ENGINE_URL` - optional llama.cpp-style `/v1/decision` endpoint.
 - `JEV_LOG_RAW_QUERY` - keep `false` unless raw user prompts are intentionally logged.
 
 ## Indexes
@@ -99,13 +112,14 @@ The router rejects stale vector indexes when the embedding model or vector dimen
 
 - `GET /stats` - JSON counters for requests, tiers, degraded requests, agent errors, and Laya decisions.
 - `GET /metrics` - Prometheus text exposition.
+- `POST /decision-test` - safe probe for the optional decision engine.
 - `jev_decisions.jsonl` - privacy-preserving decision log using query hashes by default.
 
 ## Development
 
 ```bash
 python3 -m unittest discover -v
-python3 -m py_compile core/router.py api/server.py tests/test_router.py
+python3 -m py_compile core/router.py core/decision_engine.py api/server.py tests/test_router.py
 ```
 
 ## Publication Notes

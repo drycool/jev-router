@@ -14,8 +14,14 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from core.decision_engine import (
+    DECISION_ENGINE_LOW_CONFIDENCE,
+    DECISION_ENGINE_URL,
+    DECISION_SCHEMAS,
+    DecisionEngineClient,
+)
 from core.laya_client import LAYA_CONFIDENCE_THRESHOLD
 from core.router import AgentType, JevRouter, RoutingResult, Strategy
 from agents.base import (
@@ -47,6 +53,7 @@ if not decision_logger.handlers:
 
 # ── Lifespan ──────────────────────────────────────────────────────────
 router: JevRouter = None
+decision_engine = DecisionEngineClient()
 
 
 @asynccontextmanager
@@ -147,6 +154,41 @@ class StatsResponse(BaseModel):
     agent_errors: int
     laya_predictions: int
     laya_accepted: int
+    decision_engine_requests: int
+    decision_engine_errors: int
+    decision_engine_low_confidence: int
+    decision_engine_latency_ms: float
+
+
+class DecisionTestRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    query: str = Field(..., min_length=1, max_length=16000)
+    candidates: list[str] = Field(
+        default_factory=lambda: ["exact_fts", "vector_fast", "graph_lightrag", "general_llm"],
+        min_length=1,
+        max_length=16,
+    )
+    schema_name: str = "routing_v1"
+    context: str = Field(default="", max_length=16000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_schema_alias(cls, data):
+        if isinstance(data, dict) and "schema" in data and "schema_name" not in data:
+            data = dict(data)
+            data["schema_name"] = data.pop("schema")
+        return data
+
+
+class DecisionTestResponse(BaseModel):
+    choice: str
+    confidence: float
+    latency_ms: float
+    engine: str
+    status: str
+    low_confidence: bool
+    fallback_reason: str | None = None
 
 
 # ── Stats tracking ────────────────────────────────────────────────────
@@ -160,6 +202,10 @@ _stats = {
     "agent_errors": 0,
     "laya_predictions": 0,
     "laya_accepted": 0,
+    "decision_engine_requests": 0,
+    "decision_engine_errors": 0,
+    "decision_engine_low_confidence": 0,
+    "decision_engine_latency_ms": 0.0,
 }
 
 
@@ -180,6 +226,9 @@ def _record_decision(query: str, result: RoutingResult, elapsed_ms: float, agent
             "degraded": result.degraded,
             "fallback_reason": result.fallback_reason,
             "agent_error": agent_error,
+            "decision_engine_used": False,
+            "decision_engine_candidate_count": 0,
+            "decision_engine_confidence": None,
         },
         "laya_result": result.laya_result,
     }
@@ -198,6 +247,8 @@ async def health():
         "tiers": ["fast_router", "fts5_vector", "lightrag", "llm"],
         "lightrag_api": LIGHTRAG_API,
         "llm_host": LLM_HOST,
+        "decision_engine_url": DECISION_ENGINE_URL,
+        "decision_schemas": sorted(DECISION_SCHEMAS),
     }
 
 
@@ -285,6 +336,10 @@ async def stats():
         agent_errors=_stats["agent_errors"],
         laya_predictions=_stats["laya_predictions"],
         laya_accepted=_stats["laya_accepted"],
+        decision_engine_requests=_stats["decision_engine_requests"],
+        decision_engine_errors=_stats["decision_engine_errors"],
+        decision_engine_low_confidence=_stats["decision_engine_low_confidence"],
+        decision_engine_latency_ms=round(_stats["decision_engine_latency_ms"], 2),
     )
 
 
@@ -306,6 +361,14 @@ async def metrics():
         f'jev_laya_accepted_total {_stats["laya_accepted"]}',
         "# TYPE jev_request_latency_ms_total counter",
         f'jev_request_latency_ms_total {_stats["total_ms"]:.3f}',
+        "# TYPE jev_decision_engine_requests_total counter",
+        f'jev_decision_engine_requests_total {_stats["decision_engine_requests"]}',
+        "# TYPE jev_decision_engine_errors_total counter",
+        f'jev_decision_engine_errors_total {_stats["decision_engine_errors"]}',
+        "# TYPE jev_decision_low_confidence_total counter",
+        f'jev_decision_low_confidence_total {_stats["decision_engine_low_confidence"]}',
+        "# TYPE jev_decision_engine_latency_ms_total counter",
+        f'jev_decision_engine_latency_ms_total {_stats["decision_engine_latency_ms"]:.3f}',
     ]
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse("\n".join(lines) + "\n")
@@ -336,6 +399,32 @@ async def route_only(query: str = Query(..., min_length=1, max_length=16000)):
         "degraded": result.degraded,
         "fallback_reason": result.fallback_reason,
     }
+
+
+@app.post("/decision-test", response_model=DecisionTestResponse)
+async def decision_test(req: DecisionTestRequest):
+    """Diagnostic decision-engine probe; does not affect production routing."""
+    result = await decision_engine.decide(
+        query=req.query,
+        candidates=req.candidates,
+        schema_name=req.schema_name,
+        context=req.context,
+    )
+    _stats["decision_engine_requests"] += 1
+    _stats["decision_engine_latency_ms"] += result.latency_ms
+    if result.status != "success":
+        _stats["decision_engine_errors"] += 1
+    if result.low_confidence:
+        _stats["decision_engine_low_confidence"] += 1
+    return DecisionTestResponse(
+        choice=result.choice,
+        confidence=result.confidence,
+        latency_ms=round(result.latency_ms, 2),
+        engine=result.engine,
+        status=result.status,
+        low_confidence=result.low_confidence,
+        fallback_reason=result.error,
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────
