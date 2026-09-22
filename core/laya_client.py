@@ -35,6 +35,12 @@ class LayaDecision:
     task: str | None = None
     task_confidence: float = 0.0
     difficulty: float = 0.0
+    # Which checkpoint answered, and why the router picked it.  Mandatory for the
+    # one measurement that decides the threshold: the preset confidence must be
+    # read per checkpoint (English on Latin script, multilingual on Cyrillic),
+    # never pooled into one number.
+    checkpoint: str | None = None
+    routing_reason: str | None = None
 
     @property
     def trusted(self) -> bool:
@@ -54,6 +60,7 @@ class LayaDecision:
             "latency_ms": round(self.latency_ms, 2),
             "task": self.task, "task_confidence": self.task_confidence,
             "difficulty": self.difficulty,
+            "checkpoint": self.checkpoint, "routing_reason": self.routing_reason,
         }
 
 
@@ -125,6 +132,8 @@ class LayaTier1Client:
                 task=payload.get("task"),
                 task_confidence=float(payload.get("task_confidence", 0.0)),
                 difficulty=float(payload.get("difficulty", 0.0)),
+                checkpoint=payload.get("checkpoint"),
+                routing_reason=payload.get("routing_reason"),
             )
         except (TimeoutError, httpx.TimeoutException):
             return LayaDecision(status="timeout", latency_ms=(time.perf_counter() - t0) * 1000)

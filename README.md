@@ -184,6 +184,10 @@ Two things had to be fixed after the first attempt, both found by measuring:
   out-of-distribution taxonomy — and the wrong answer was the confident one (0.9995). The
   threshold now gates the shipped preset `task` signal only; the invented labels are recorded
   for analysis and no longer consulted.
+- **One authority was deliberately left in place: `target_agent`.** The `DB` vs `GENERAL` choice
+  still follows the classifier's invented `strategy` label, gated on the trusted signal.
+  Replacing it changes production semantics and removing it would drop a capability, so it is
+  documented here rather than changed quietly. It is the last thing that label acts on.
 
 ### Why our own taxonomy had to be replaced
 
@@ -270,6 +274,9 @@ requests the local path answered without waiting for the classifier. A high `lay
 beside a low `laya_accepted` is the shape to want: the classifier is not earning its latency on
 that traffic.
 
+Every successful verdict also records `checkpoint` and `routing_reason`. Those two fields are what
+make the threshold measurable per model rather than pooled across two that need not agree.
+
 ## Benchmarking the Laya tier
 
 ```bash
@@ -283,11 +290,26 @@ Every disagreement is printed — a caller cannot be misled by a tidy summary. A
 `--include-baseline` to score the local regex domain classifier on the same fixture, which is
 the comparison that matters.
 
+### Setting the threshold from data
+
+The gate can only be set from real traffic, and only per checkpoint — the English and multilingual
+models need not report preset confidence on the same scale, and merging them is how a threshold
+ends up calibrated for neither:
+
+```bash
+python3 scripts/analyze_laya_verdicts.py --threshold 0.90
+```
+
+It reads `jev_decisions.jsonl` and reports, per checkpoint: the `task` confidence distribution
+(median / p90 / max), the share clearing the gate, the invented confidence for contrast, and the
+status breakdown (`not_awaited` / `success` / `timeout`). A checkpoint whose share is ~0 is not
+calibrated — it simply never fires, which is a different problem from a threshold set too low.
+
 ## Development
 
 ```bash
 python3 -m unittest discover -v
-python3 -m py_compile core/router.py core/decision_engine.py core/shadow.py api/server.py scripts/benchmark_laya.py tests/test_router.py
+python3 -m py_compile core/router.py core/decision_engine.py core/shadow.py core/laya_client.py api/server.py scripts/benchmark_laya.py scripts/measure_route_latency.py scripts/analyze_laya_verdicts.py tests/test_router.py
 ```
 
 ## Publication Notes

@@ -527,6 +527,7 @@ class LayaClientTests(unittest.TestCase):
                     "strategy": "complex_llm", "domain": "raspberry_pi", "confidence": 0.31,
                     "status": "success", "task": "code",
                     "task_confidence": 0.9255, "difficulty": 3.0,
+                    "checkpoint": "multilingual", "routing_reason": "non-Latin script (cyrillic)",
                 },
             )
 
@@ -537,3 +538,9 @@ class LayaClientTests(unittest.TestCase):
         self.assertAlmostEqual(decision.difficulty, 3.0)
         self.assertTrue(decision.trusted)
         self.assertEqual(decision.to_dict()["task"], "code")
+        # The checkpoint is what makes the threshold measurable: the two checkpoints
+        # need not report preset confidence on the same scale, so it must reach the
+        # decision log rather than being pooled away.
+        self.assertEqual(decision.checkpoint, "multilingual")
+        self.assertEqual(decision.routing_reason, "non-Latin script (cyrillic)")
+        self.assertEqual(decision.to_dict()["checkpoint"], "multilingual")
