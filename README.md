@@ -316,6 +316,111 @@ disk (mtime + size), so rebuilding it does not require a restart. Loading it per
 and because the load is synchronous, it also delayed timer callbacks, which is why the
 classifier's 150 ms budget was observed firing at ~420 ms.
 
+## Ground truth: what can be labelled and what cannot
+
+The router cannot judge its own answers, so the logs are split by whose account they are.
+
+**`jev_decisions.jsonl` — the router's account.** One record per call, and every record
+carries a `decision_id` that is returned in the `/query` response. A `signals` block reports
+what the router can observe about itself, and **none of it is a judgement**:
+
+```json
+{"schema": "decision_v2", "decision_id": "2ad018dd...", "timestamp": "...",
+ "decision": {"strategy": "exact_fts", "confidence": 0.95, ...},
+ "signals": {"answered": true, "answer_chars": 2391, "answer_preview": "The user is asking...",
+             "context_chars": 500, "tier": "tier2", "lightrag_required": false,
+             "lightrag_mode": "skip", "execute_requested": true},
+ "execution": {"latency_ms": 15098.4, "degraded": false, "agent_error": false, ...}}
+```
+
+`answered`, `tier`, `latency_ms`, `degraded` are signals. Reading them as accuracy would be
+the central mistake this design exists to prevent.
+
+**`jev_feedback.jsonl` — the consumer's account.** A verdict arrives after the fact, so it
+cannot be a field in an append-only record: a second line for the same `decision_id` would
+raise "which line wins?", which is exactly the ambiguity that made `query_hash` unusable for
+labelling. It goes to its own file and the two are joined by `decision_id`.
+
+```bash
+curl -s -X POST http://127.0.0.1:8030/feedback -H "Content-Type: application/json" \
+  -d '{"decision_id":"2ad018dd...","verdict":"rejected","source":"human",
+       "comment":"the manual gives the torque for a cold engine; the answer does not say so"}'
+```
+
+| verdict | meaning |
+|---|---|
+| `accepted` | usable as given |
+| `partial` | needed correction or further work |
+| `rejected` | wrong |
+
+There is deliberately no `unknown`. An abstention carries no signal and would only inflate
+the label count. `source` is `human`, `script` or `agent`; several verdicts per decision are
+kept, because an agent's guess followed by a human's correction is the normal sequence and
+collapsing them would destroy the fact that the human disagreed. Precedence (human over
+agent, later over earlier) is applied at read time.
+
+Agents reach the same endpoint through the `jev_feedback` MCP tool, quoting the
+`decision_id` printed with every `jev_query` answer.
+
+### Answer previews
+
+`JEV_LOG_ANSWER_PREVIEW` (default `true`, `JEV_PREVIEW_CHARS=400`) writes a bounded
+answer and context preview into each decision. Without it a decision can only be labelled
+while the answer is still in hand — i.e. never — so the log cannot be labelled at all. The
+default is on because the corpus here is a public car manual; set it to `false` to log
+signals without content. The length stays either way: it is a signal about the answer, not
+the answer itself.
+
+### Is there enough to act on?
+
+```bash
+python3 scripts/label_coverage.py                 # coverage, label trust, readiness verdict
+python3 scripts/label_coverage.py --json
+```
+
+The report never prints accuracy: a percentage computed from a handful of self-reported
+labels would look like a metric and mean nothing. It reports what is real — how many
+decisions have a verdict, whether any verdict class is below a usable floor, and whether
+cheap agent labels have ever been checked against a human. Its first run, honestly:
+
+```
+decisions            52
+  by schema          {'decision_v1': 51, 'decision_v2': 1}
+  no decision_id     51  <- v1 records, unlabellable forever
+feedback entries     2
+  orphans            1  <- judged an id the log does not have
+
+label coverage
+  labelled           1 / 52  (1.9%)
+
+dataset readiness
+  Not usable yet. 1 labelled decisions, but these verdict
+  classes are below the floor of 20: {'rejected': 1}
+```
+
+The `51 unlabellable` line is not a bug: records written before `decision_id` existed can
+never be labelled, because a verdict has nothing to attach to. This is the argument for
+adding the field now rather than after the log grows.
+
+### Test runs are redirected away from these logs
+
+A test that posts to `/query` appends a real record, because the endpoint cannot tell a
+fixture from traffic. It happened: 20 of the 71 records in `jev_decisions.jsonl` (28%) were
+the fixture string `"Raspberry Pi cable"` from `ShadowProbeTests`, all with empty keywords
+and entities. Any statistic over that log was inflated by them, and a dataset built from it
+would have been trained on test scaffolding.
+
+`tests/__init__.py` now redirects `JEV_DECISION_LOG_PATH` and `JEV_FEEDBACK_LOG_PATH` to a
+temp directory before any test module is imported, so no test — including ones written later
+by someone who never reads that file — can reach the production logs. The redirect is
+asserted by `TestProductionLogsAreProtected`, so removing it fails loudly. Existing
+contamination is removed with:
+
+```bash
+python3 scripts/quarantine_queries.py --query "Raspberry Pi cable"          # dry run
+python3 scripts/quarantine_queries.py --query "Raspberry Pi cable" --apply  # moves to .quarantine
+```
+
 ## Observability
 
 - `GET /stats` - JSON counters for requests, tiers, degraded requests, agent errors, Laya decisions, and shadow probes.

@@ -9,9 +9,10 @@ import os
 import hashlib
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import cast
+from typing import Literal, cast
 
 from core.env import load_env
 
@@ -60,6 +61,32 @@ LIGHTRAG_CHUNKS_PATH = os.getenv(
 )
 LOG_RAW_QUERY = os.getenv("JEV_LOG_RAW_QUERY", "false").lower() == "true"
 
+# ── Ground truth ──────────────────────────────────────────────────────
+# The router cannot decide whether its own answer was correct; only the consumer can.
+# So the decision log holds the router's account (what it chose and what it cost) and the
+# verdict lives in a second file. They are joined by decision_id.
+#
+# decision_id exists because query_hash could not do this job: it is sha256 of the query
+# text, so asking the same question twice produced two records that could not be told
+# apart, and no verdict could be attached to a specific call.
+#
+# Nothing about *what* was answered used to be logged, which meant a decision could only
+# be labelled while the answer was still in hand - i.e. never. A bounded preview makes
+# post-hoc labelling possible. On by default because the corpus here is a public car
+# manual and an unlabelled log cannot train or calibrate anything; set
+# JEV_LOG_ANSWER_PREVIEW=false to return to the previous behaviour.
+LOG_ANSWER_PREVIEW = os.getenv("JEV_LOG_ANSWER_PREVIEW", "true").lower() == "true"
+PREVIEW_CHARS = int(os.getenv("JEV_PREVIEW_CHARS", "400"))
+
+# A verdict arrives after the fact, so it cannot be a field in an append-only record: a
+# second line for the same decision_id raises "which line wins?", which is exactly the
+# ambiguity that made query_hash useless. Hence a separate append-only file, joined by id.
+FEEDBACK_LOG_PATH = os.getenv(
+    "JEV_FEEDBACK_LOG_PATH", os.path.join(PROJECT_ROOT, "jev_feedback.jsonl")
+)
+VERDICTS = ("accepted", "rejected", "partial")
+FEEDBACK_SOURCES = ("human", "agent", "script")
+
 # ── Shadow mode ───────────────────────────────────────────────────────
 # A candidate decision engine probed on real traffic, off the request path.
 # "off" is the default: nothing is probed until someone opts in per target.
@@ -80,6 +107,70 @@ if not decision_logger.handlers:
     handler.setFormatter(logging.Formatter("%(message)s"))
     decision_logger.addHandler(handler)
     decision_logger.propagate = False
+
+feedback_logger = logging.getLogger("jev.feedback")
+feedback_logger.setLevel(logging.INFO)
+if not feedback_logger.handlers:
+    handler = logging.FileHandler(FEEDBACK_LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    feedback_logger.addHandler(handler)
+    feedback_logger.propagate = False
+
+
+def _decision_id_known(decision_id: str) -> bool:
+    """Report whether a decision with this id is in the decision log.
+
+    Feedback for an unknown id is recorded anyway: the log may have been rotated, and
+    discarding a human verdict over our own bookkeeping would throw away the most
+    expensive data we have. It is flagged instead, so orphaned verdicts stay visible
+    rather than quietly inflating the label count.
+
+    This reads the whole log, which is linear. It is acceptable because feedback is a rare
+    call - a handful per session - while /query is the hot path and never touches this.
+    """
+    try:
+        if os.path.getsize(DECISION_LOG_PATH) > 64 * 1024 * 1024:
+            # Too large to scan inside a request. Say "known" and let the offline
+            # analyzer, which reads the file once anyway, decide the truth.
+            return True
+        with open(DECISION_LOG_PATH, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("decision_id") == decision_id:
+                    return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _feedback_history(decision_id: str) -> tuple[str | None, int]:
+    """Return the most recent verdict already recorded for a decision, and how many.
+
+    Verdicts are append-only, so one decision may collect several: an agent's guess first,
+    a human's correction later. The count and the previous verdict go back to the caller so
+    a correction is visibly a correction rather than a first label, and the precedence rule
+    (human over agent, later over earlier) is applied at read time by
+    scripts/label_coverage.py instead of being baked in at write time - where it would
+    either lose the disagreement or require rewriting an append-only file.
+    """
+    latest: str | None = None
+    count = 0
+    try:
+        with open(FEEDBACK_LOG_PATH, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("decision_id") == decision_id:
+                    count += 1
+                    latest = entry.get("verdict")
+    except FileNotFoundError:
+        return None, 0
+    return latest, count
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────
@@ -204,6 +295,10 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
+    # The id of the decision record this answer produced. Callers quote it back to
+    # /feedback to turn a log line into a labelled example; without it a verdict would
+    # have nothing to attach to.
+    decision_id: str = ""
     routing_decision: dict
     extracted_metadata: dict
     rag_configuration: dict
@@ -213,6 +308,31 @@ class QueryResponse(BaseModel):
     elapsed_ms: float = 0.0
     degraded: bool = False
     fallback_reason: str | None = None
+
+
+class FeedbackRequest(BaseModel):
+    """A consumer's verdict on one decision.
+
+    `verdict` describes the answer, not the router: accepted means the answer was usable
+    as given, partial means it needed correction or further work, rejected means it was
+    wrong. There is deliberately no "unknown" - an abstention carries no signal and would
+    only inflate the label count.
+    """
+
+    decision_id: str = Field(..., min_length=1, max_length=64)
+    verdict: Literal["accepted", "rejected", "partial"]
+    source: Literal["human", "agent", "script"] = "agent"
+    comment: str = Field(default="", max_length=2000)
+
+
+class FeedbackResponse(BaseModel):
+    recorded: bool
+    decision_id: str
+    known_decision: bool
+    verdict: str
+    source: str
+    verdicts_for_decision: int
+    previous_verdict: str | None = None
 
 
 class StatsResponse(BaseModel):
@@ -237,6 +357,11 @@ class StatsResponse(BaseModel):
     shadow_latency_ms_avg: float
     shadow_choices: dict[str, int]
     shadow: dict
+    # Verdicts received, and how many of them referenced a decision this log does not
+    # know. The orphan count is the one to watch: verdicts that attach to nothing inflate
+    # a label count without labelling anything.
+    feedback: int
+    feedback_orphans: int
 
 
 class DecisionTestRequest(BaseModel):
@@ -292,6 +417,8 @@ _stats = {
     "shadow_low_confidence": 0,
     "shadow_latency_ms": 0.0,
     "shadow_choices": {},
+    "feedback": 0,
+    "feedback_orphans": 0,
 }
 
 
@@ -317,9 +444,42 @@ def _laya_status(result: RoutingResult) -> str:
     return str((result.laya_result or {}).get("status", "absent"))
 
 
-def _record_decision(query: str, result: RoutingResult, elapsed_ms: float, agent_error: bool = False) -> None:
-    """Write one privacy-preserving JSONL event for later evaluation/ML labels."""
+# Which pipeline tier a strategy belongs to, for reporting rather than routing.
+_TIER_OF = {
+    Strategy.DIRECT_ACTION.value: "tier1",
+    Strategy.EXACT_FTS.value: "tier2",
+    Strategy.VECTOR_FAST.value: "tier2",
+    Strategy.GRAPH_LIGHTRAG.value: "tier3",
+    Strategy.GENERAL_LLM.value: "tier4",
+}
+
+
+def _record_decision(
+    query: str,
+    result: RoutingResult,
+    elapsed_ms: float,
+    agent_error: bool,
+    decision_id: str,
+    agent_response: str = "",
+    execute: bool = True,
+) -> None:
+    """Write one privacy-preserving JSONL event for later evaluation/ML labels.
+
+    The distinction this record draws is the point of the whole file. `signals` is what the
+    router can observe about itself: whether an answer came out, how long it is, which tier
+    produced it, how long it took, whether a tier degraded. None of it is a judgement, and
+    none of it may be read as ground truth, because the router cannot know whether its own
+    answer was right - only the consumer can.
+
+    So the verdict is not here. It arrives later from the consumer, lands in
+    jev_feedback.jsonl, and is joined to this record by `decision_id`.
+    """
+    answer = agent_response or ""
+    context = result.context or ""
+
     event = {
+        "schema": "decision_v2",
+        "decision_id": decision_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "query_hash": hashlib.sha256(query.encode("utf-8")).hexdigest(),
         "decision": {
@@ -328,6 +488,17 @@ def _record_decision(query: str, result: RoutingResult, elapsed_ms: float, agent
             "keywords": result.extracted_metadata.keywords,
             "entities": result.extracted_metadata.entities,
             "domain": result.extracted_metadata.domain,
+        },
+        "signals": {
+            "answered": bool(answer.strip()),
+            "answer_chars": len(answer),
+            "answer_preview": answer[:PREVIEW_CHARS] if (LOG_ANSWER_PREVIEW and answer) else None,
+            "context_chars": len(context),
+            "context_preview": context[:PREVIEW_CHARS] if (LOG_ANSWER_PREVIEW and context) else None,
+            "tier": _TIER_OF.get(result.routing_decision.strategy.value, "tier4"),
+            "lightrag_required": result.rag_configuration.lightrag_required,
+            "lightrag_mode": result.rag_configuration.lightrag_mode,
+            "execute_requested": execute,
         },
         "execution": {
             "latency_ms": round(elapsed_ms, 2),
@@ -369,6 +540,15 @@ async def health():
             "sample_rate": SHADOW_SAMPLE_RATE,
             "requests": _stats["shadow_requests"],
         },
+        "ground_truth": {
+            "decision_log": DECISION_LOG_PATH,
+            "feedback_log": FEEDBACK_LOG_PATH,
+            "answer_preview_logged": LOG_ANSWER_PREVIEW,
+            "preview_chars": PREVIEW_CHARS,
+            "verdicts": list(VERDICTS),
+            "sources": list(FEEDBACK_SOURCES),
+            "feedback_received": _stats["feedback"],
+        },
     }
 
 
@@ -379,6 +559,10 @@ async def query(req: QueryRequest):
     """
     t0 = time.perf_counter()
     _stats["total"] += 1
+
+    # Minted before routing so the id identifies this call whatever happens next, and is
+    # returned to the caller: it is the handle a verdict is attached to.
+    decision_id = uuid.uuid4().hex
 
     # Tier 1-3: Route
     result: RoutingResult = await router.route(req.query)
@@ -421,9 +605,18 @@ async def query(req: QueryRequest):
 
     elapsed = (time.perf_counter() - t0) * 1000
     _stats["total_ms"] += elapsed
-    _record_decision(req.query, result, elapsed, agent_error)
+    _record_decision(
+        req.query,
+        result,
+        elapsed,
+        agent_error,
+        decision_id=decision_id,
+        agent_response=agent_response,
+        execute=req.execute,
+    )
 
     return QueryResponse(
+        decision_id=decision_id,
         routing_decision={
             "strategy": result.routing_decision.strategy.value,
             "confidence_score": result.routing_decision.confidence_score,
@@ -449,6 +642,48 @@ async def query(req: QueryRequest):
     )
 
 
+@app.post("/feedback", response_model=FeedbackResponse)
+async def feedback(req: FeedbackRequest):
+    """Record a consumer's verdict on one decision.
+
+    This is the only ground truth this system can have, because the router cannot judge its
+    own answers. Everything in jev_decisions.jsonl - tier, latency, whether an answer came
+    out - is a signal, and no amount of it becomes a label.
+
+    Several verdicts per decision are allowed and all are kept: an agent's guess followed by
+    a human's correction is the normal sequence, and collapsing them here would destroy the
+    fact that the human disagreed. Precedence is a read-time decision.
+    """
+    previous_verdict, count = _feedback_history(req.decision_id)
+    known = _decision_id_known(req.decision_id)
+
+    event = {
+        "schema": "feedback_v1",
+        "decision_id": req.decision_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "verdict": req.verdict,
+        "source": req.source,
+        "known_decision": known,
+        "previous_verdict": previous_verdict,
+        "comment": req.comment,
+    }
+    feedback_logger.info(json.dumps(event, ensure_ascii=False))
+
+    _stats["feedback"] += 1
+    if not known:
+        _stats["feedback_orphans"] += 1
+
+    return FeedbackResponse(
+        recorded=True,
+        decision_id=req.decision_id,
+        known_decision=known,
+        verdict=req.verdict,
+        source=req.source,
+        verdicts_for_decision=count + 1,
+        previous_verdict=previous_verdict,
+    )
+
+
 @app.get("/stats")
 async def stats():
     """Pipeline statistics."""
@@ -468,6 +703,8 @@ async def stats():
         decision_engine_errors=_stats["decision_engine_errors"],
         decision_engine_low_confidence=_stats["decision_engine_low_confidence"],
         decision_engine_latency_ms=round(_stats["decision_engine_latency_ms"], 2),
+        feedback=_stats["feedback"],
+        feedback_orphans=_stats["feedback_orphans"],
         shadow_requests=_stats["shadow_requests"],
         shadow_errors=_stats["shadow_errors"],
         shadow_timeouts=_stats["shadow_timeouts"],

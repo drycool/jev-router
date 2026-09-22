@@ -12,7 +12,14 @@ __pycache__/
 
 *.log
 *.pid
+# Decision and feedback logs carry answer previews and verdicts; they stay local.
 jev_decisions.jsonl
+jev_feedback.jsonl
+# Quarantine and backups written by scripts/quarantine_queries.py
+jev_decisions.jsonl.quarantine
+jev_feedback.jsonl.quarantine
+jev_decisions.jsonl.bak-*
+jev_feedback.jsonl.bak-*
 # Benchmark outputs embed raw queries; keep them local like the decision log.
 laya_benchmark.jsonl
 decision_benchmark.jsonl
