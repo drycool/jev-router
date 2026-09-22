@@ -231,6 +231,7 @@ All runtime configuration is environment-based. Start from `.env.example`.
 Important variables:
 
 - `JEV_LIGHTRAG_API` - LightRAG HTTP endpoint.
+- `JEV_LIGHTRAG_ENABLED` - `1` (default) calls the graph tier; `0` parks it and serves the same local retrieval instantly. See **Deferred** below.
 - `JEV_LIGHTRAG_CHUNKS_PATH` - source `kv_store_text_chunks.json` used to rebuild FTS5 on startup.
 - `JEV_LLM_HOST` and `JEV_LLM_MODEL` - Ollama-compatible generation endpoint and model.
 - `JEV_EMBEDDING_API` and `JEV_EMBEDDING_MODEL` - embedding endpoint/model for vector search.
@@ -241,6 +242,49 @@ Important variables:
 - `JEV_SHADOW_MODE` - `off` (default), `laya`, or `decision`; what to probe in the background.
 - `JEV_SHADOW_URL`, `JEV_SHADOW_TIMEOUT_S`, `JEV_SHADOW_MAX_INFLIGHT`, `JEV_SHADOW_SAMPLE_RATE` - shadow probe controls.
 - `JEV_LOG_RAW_QUERY` - keep `false` unless raw user prompts are intentionally logged.
+
+## Deferred (in development)
+
+### LightRAG graph tier - parked until the GPU budget grows
+
+Measured 2026-09-22 and recorded here so it does not have to be re-derived:
+
+| phase | measured |
+| --- | --- |
+| context only (`only_need_context`) | 10.9 s |
+| full query, card free | 40.2 s |
+| full query, Laya resident | 62.0 s |
+
+So `JEV_LIGHTRAG_READ_TIMEOUT_S=5` guarantees `lightrag_timeout` on every fall-through
+request: the router gives up about 5 s into an 11 s floor, and the request pays for nothing.
+The dominant cost is the size of the retrieved context (`top_k=40` returns ~19.6k prompt
+tokens, so most of the generation phase is prefill), and `top_k=10` measured 24.3 s end to
+end - better, still far outside the budget. Two levers were quantified: the `top_k` table
+and the `num_ctx`-as-a-VRAM-decision measurement. Full breakdown, including the
+order-dependent nature of the VRAM spill and the fact that LightRAG caches answers by query
+text, is in the `rag-query` skill under `references/performance-diagnosis.md`.
+
+**Decision:** optimisation is frozen until GPU VRAM grows. The tier is not deleted - it is
+switched off the request path, so the freeze costs nothing while it waits:
+
+```bash
+JEV_LIGHTRAG_ENABLED=0   # skip the call, serve the same local retrieval instantly
+```
+
+That returns the same context the timeout path already served, with
+`fallback_reason=lightrag_disabled` instead of `lightrag_timeout`, and reports
+`rag_configuration.lightrag_required=false`. `GET /health` exposes the current state.
+
+Measured on one fall-through query, same answer either way (500-character preview
+identical): fresh query 5.45 s -> 0.43 s; already-cached query 0.80 s -> 0.43 s. Worth
+being precise about what the switch does *not* do: the fall-through path still calls the
+GPU2 embedding API for vector search (~32 ms when the box is healthy, under a 30 s client
+timeout), so this is not a "local-only" path. Parking the graph tier removes the call that
+was guaranteed to fail; it does not remove the GPU dependency.
+
+**Resume when** the retrieved-context size and the GPU budget are both addressed - not
+before. Raising the timeout alone was explicitly rejected: it converts a fast degraded
+answer into a 40-62 s wait.
 
 ## Indexes
 

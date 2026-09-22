@@ -25,7 +25,7 @@ from core.decision_engine import (
     DecisionEngineClient,
 )
 from core.laya_client import LAYA_CONFIDENCE_THRESHOLD, LAYA_URL
-from core.router import AgentType, JevRouter, RoutingResult, Strategy
+from core.router import AgentType, JevRouter, LIGHTRAG_ENABLED, RoutingResult, Strategy
 from core.shadow import ShadowProbe, ShadowTarget
 from agents.base import (
     GeneralAgent, CodeAgent, DBAgent, TroubleshooterAgent,
@@ -340,6 +340,7 @@ async def health():
         "service": "jev-router",
         "tiers": ["fast_router", "fts5_vector", "lightrag", "llm"],
         "lightrag_api": LIGHTRAG_API,
+        "lightrag_enabled": LIGHTRAG_ENABLED,
         "llm_host": LLM_HOST,
         "decision_engine_url": DECISION_ENGINE_URL,
         "decision_schemas": sorted(DECISION_SCHEMAS),

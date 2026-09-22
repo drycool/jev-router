@@ -27,6 +27,13 @@ VECTOR_DB_PATH = os.getenv("JEV_VECTOR_DB_PATH", str(PROJECT_ROOT / "storage" / 
 LIGHTRAG_API = os.getenv("JEV_LIGHTRAG_API", "http://localhost:8020")
 LIGHTRAG_CONNECT_TIMEOUT_S = float(os.getenv("JEV_LIGHTRAG_CONNECT_TIMEOUT_S", "1"))
 LIGHTRAG_READ_TIMEOUT_S = float(os.getenv("JEV_LIGHTRAG_READ_TIMEOUT_S", "5"))
+# On this hardware the graph tier cannot answer inside its own budget: even
+# retrieval alone measured 10.9 s against a 5 s read timeout, so calling it is a
+# guaranteed timeout and the request pays for nothing. The tier is parked until the
+# GPU budget is resolved (see README, "Deferred"). Disabling it skips the call and
+# serves exactly the context the timeout path would have served, without the wait.
+# Default preserves the existing behaviour.
+LIGHTRAG_ENABLED = os.getenv("JEV_LIGHTRAG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 EMBEDDING_API = os.getenv("JEV_EMBEDDING_API", "http://192.168.11.87:11434/api/embed")
 EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "mxbai-embed-large")
 
@@ -598,8 +605,12 @@ class JevRouter:
                 laya_result=_settled_laya(laya_task),
             )
 
-        # Do not make a remote embedding call when there is no vector index to
-        # search.  This installation currently uses FTS5 + LightRAG only.
+        # The vector index is optional and this installation does have one
+        # (storage/jev_vectors.npz, mxbai-embed-large, 1024d), so this call does go to
+        # GPU2 - measured ~32 ms when the box is healthy. That makes it the one
+        # remaining GPU dependency on the fall-through path once the graph tier is
+        # parked, and its 30 s client timeout is the worst case it can cost: a
+        # rebooting GPU2 was observed stalling a request for ~16 s.
         query_embedding = await self.get_embedding(query) if Path(VECTOR_DB_PATH).exists() else None
         vector_results = self.tier2.search_vector(query, query_embedding, domain=domain) if query_embedding is not None else []
         tier2_results = fts_results + [
@@ -655,7 +666,12 @@ class JevRouter:
         # Determine mode based on query characteristics
         lightrag_mode = self._determine_lightrag_mode(query)
 
-        tier3_result = await self.tier3.search(query, mode=lightrag_mode)
+        if LIGHTRAG_ENABLED:
+            tier3_result = await self.tier3.search(query, mode=lightrag_mode)
+        else:
+            # Parked, not broken: no call is made, and the degraded branch below
+            # serves the same local retrieval a timeout would have served.
+            tier3_result = {"response": "", "error_type": "disabled", "elapsed_ms": 0.0}
 
         context = tier3_result.get("response", "")
         fallback_reason = None
@@ -680,7 +696,7 @@ class JevRouter:
                 domain=domain,
             ),
             rag_configuration=RAGConfiguration(
-                lightrag_required=True,
+                lightrag_required=LIGHTRAG_ENABLED,
                 lightrag_mode=lightrag_mode,
             ),
             target_agent=target_agent,

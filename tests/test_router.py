@@ -238,6 +238,44 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(result.laya_result["domain"], "raspberry_pi")
                 router.tier2.close()
 
+    def test_disabled_graph_tier_serves_the_local_answer_without_waiting(self):
+        """The graph tier is parked on this hardware: retrieval alone measured 10.9 s
+        against a 5 s budget, so calling it is a guaranteed timeout that pays for
+        nothing. Disabling it must skip the call and still return the same context
+        the timeout path served - same answer, none of the wait."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                with patch("core.router.LIGHTRAG_ENABLED", False):
+                    router = JevRouter()
+                    router.tier2.index_chunk("one", "Torque settings for various fasteners")
+                    router.tier2.commit()
+
+                    async def must_not_run(*_, **__):
+                        raise AssertionError("the graph tier must not be called when parked")
+
+                    class Laya:
+                        async def predict_routing(self, _):
+                            return LayaDecision(strategy="general_fallback", status="success")
+
+                    async def no_embedding(_):
+                        return None
+
+                    router.tier3.search = must_not_run
+                    router.laya = Laya()
+                    router.get_embedding = no_embedding
+
+                    started = time.perf_counter()
+                    result = asyncio.run(router.route("torque of the cylinder head bolts"))
+                    elapsed = time.perf_counter() - started
+
+                    self.assertEqual(result.routing_decision.strategy, Strategy.GRAPH_LIGHTRAG)
+                    self.assertTrue(result.degraded)
+                    self.assertEqual(result.fallback_reason, "lightrag_disabled")
+                    self.assertIn("Torque settings", result.context)
+                    self.assertFalse(result.rag_configuration.lightrag_required)
+                    self.assertLess(elapsed, 0.5)
+                    router.tier2.close()
+
     def test_stats_exposes_observability_counters(self):
         client = TestClient(server.app)
         response = client.get("/stats")
