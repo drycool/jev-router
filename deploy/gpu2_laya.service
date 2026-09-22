@@ -1,3 +1,13 @@
+# Alternative to the crontab @reboot entry, for hosts where you control root.
+#
+# A *user* unit only starts at boot when lingering is enabled for the account:
+#
+#     sudo loginctl enable-linger $USER
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now gpu2_laya.service
+#
+# Without lingering the unit silently does not come back after a reboot, which is
+# why the deployed setup on GPU2 uses `crontab @reboot` + laya-ctl.sh instead.
 [Unit]
 Description=Jev Laya Tier-1 inference service
 After=network-online.target
@@ -7,9 +17,17 @@ Type=simple
 User=dry
 WorkingDirectory=/home/dry/jev-laya
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/dry/jev-laya/.venv/bin/uvicorn gpu2_laya_service:app --host 0.0.0.0 --port 8031
+# Router mode preloads english+multilingual and picks per request from the script.
+# Set LAYA_MODE=single plus LAYA_SUBFOLDER to pin one checkpoint instead.
+Environment=LAYA_MODE=router
+Environment=LAYA_PRELOAD=english,multilingual
+ExecStart=/home/dry/jev-laya/.venv/bin/uvicorn gpu2_laya_service:app --host 0.0.0.0 --port 8031 --workers 1
+# The idle watchdog powers the box off; Restart=on-failure alone would leave a
+# crashed service down until the next boot, which is why the health endpoint and
+# Jev's own fallback matter more than aggressive restarting here.
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=600
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
