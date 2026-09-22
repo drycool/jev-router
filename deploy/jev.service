@@ -1,0 +1,31 @@
+[Unit]
+Description=Jev router - 4-tier RAG/agent gateway on port 8030
+Documentation=file:///home/dry/Jev/README.md
+# Written after a real reboot took the router down and left every consumer with
+# "router unreachable" from the MCP client. It used to live in a tmux session, which is not a
+# startup mechanism: nothing restarted it, and nothing reported that it was gone. The first
+# sign of trouble was a tool call failing, which is the good version of that story - the
+# health tool said the router was unreachable instead of letting an empty answer look like a
+# broken tier.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dry/Jev
+# The project has no virtualenv; the system interpreter already carries fastapi/uvicorn.
+ExecStart=/usr/bin/python3 -m api.server --port 8030
+Environment=PYTHONUNBUFFERED=1
+
+# Restart=always rather than on-failure: the interesting failure here is not a crash but the
+# machine powering off, and on reboot this unit is what brings the service back.
+Restart=always
+RestartSec=3
+
+# SIGINT gives uvicorn its graceful path, so an in-flight decision is written whole rather
+# than leaving a half-line in the decision log.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

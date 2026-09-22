@@ -444,6 +444,28 @@ python3 scripts/quarantine_queries.py --query "Raspberry Pi cable"          # dr
 python3 scripts/quarantine_queries.py --query "Raspberry Pi cable" --apply  # moves to .quarantine
 ```
 
+## Running as a service
+
+`deploy/jev.service` is a systemd **user** unit, installed as `~/.config/systemd/user/jev.service`:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/jev.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now jev.service
+systemctl --user status jev.service
+journalctl --user -u jev.service -f
+```
+
+A user unit needs `loginctl enable-linger $USER` to start without a login; it is already `yes`
+on this machine. Without linger, `systemctl --user` units exist only while the user is logged in,
+which looks identical to working until the first reboot.
+
+This matters because the router previously ran in a **tmux session**, which is not a startup
+mechanism. A reboot took it down and nothing restarted it or reported it gone — the first sign
+was a consumer's tool call failing. If a service is meant to be reachable, its startup has to be
+owned by init, not by a terminal that happens to be open.
+
 ## Observability
 
 - `GET /stats` - JSON counters for requests, tiers, degraded requests, agent errors, Laya decisions, and shadow probes.
