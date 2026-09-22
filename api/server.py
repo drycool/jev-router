@@ -13,6 +13,14 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import cast
 
+from core.env import load_env
+
+# Configuration is read at import time by the modules below, so `.env` has to be applied
+# before any of them are imported - hence a call between imports rather than at the top.
+# A variable already present in the process environment wins (see core/env.py): exporting
+# a value for one run must not be silently overridden by the checked-in file.
+load_env()
+
 import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
@@ -25,7 +33,14 @@ from core.decision_engine import (
     DecisionEngineClient,
 )
 from core.laya_client import LAYA_CONFIDENCE_THRESHOLD, LAYA_URL
-from core.router import AgentType, JevRouter, LIGHTRAG_ENABLED, RoutingResult, Strategy
+from core.router import (
+    EMBEDDING_TIMEOUT_S,
+    AgentType,
+    JevRouter,
+    LIGHTRAG_ENABLED,
+    RoutingResult,
+    Strategy,
+)
 from core.shadow import ShadowProbe, ShadowTarget
 from agents.base import (
     GeneralAgent, CodeAgent, DBAgent, TroubleshooterAgent,
@@ -341,6 +356,7 @@ async def health():
         "tiers": ["fast_router", "fts5_vector", "lightrag", "llm"],
         "lightrag_api": LIGHTRAG_API,
         "lightrag_enabled": LIGHTRAG_ENABLED,
+        "vector_timeout_s": EMBEDDING_TIMEOUT_S,
         "llm_host": LLM_HOST,
         "decision_engine_url": DECISION_ENGINE_URL,
         "decision_schemas": sorted(DECISION_SCHEMAS),

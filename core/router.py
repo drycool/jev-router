@@ -36,6 +36,14 @@ LIGHTRAG_READ_TIMEOUT_S = float(os.getenv("JEV_LIGHTRAG_READ_TIMEOUT_S", "5"))
 LIGHTRAG_ENABLED = os.getenv("JEV_LIGHTRAG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 EMBEDDING_API = os.getenv("JEV_EMBEDDING_API", "http://192.168.11.87:11434/api/embed")
 EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "mxbai-embed-large")
+# Total budget for the embedding call, enforced with asyncio.timeout (same reason as the
+# classifier: an httpx timeout is per socket read, not a deadline). The embedder lives on
+# the node that powers itself off when idle, and this is the fall-through path's only
+# remaining GPU dependency - a 30 s client timeout let a sleeping node stall a request for
+# almost that long (observed ~16 s while the box was coming up). Healthy cost is ~32 ms,
+# so this is ~60x headroom. On expiry the vector layer is skipped and the local FTS
+# results are served, exactly as when the embedder is unreachable.
+EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "2.0"))
 
 
 class Strategy(str, Enum):
@@ -295,6 +303,38 @@ class Tier2Search:
 
     def __init__(self):
         self._init_fts5()
+        # The vector index is read once and re-read only when the file changes. Loading it
+        # per request cost ~310 ms of blocked event loop on this hardware while the cosine
+        # search itself takes ~13 ms - and because the load is synchronous it also delayed
+        # timer callbacks, which is why the classifier's 150 ms budget was observed firing
+        # at ~420 ms.
+        self._vector_cache: Optional[tuple[tuple[int, int], dict[str, Any]]] = None
+
+    def _load_vector_index(self) -> Optional[dict[str, Any]]:
+        """Return the vector index, reloading only if the file changed on disk."""
+        path = Path(VECTOR_DB_PATH)
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = (stat.st_mtime_ns, stat.st_size)
+        if self._vector_cache is not None and self._vector_cache[0] == key:
+            return self._vector_cache[1]
+        try:
+            with np.load(path, allow_pickle=False) as db:
+                data: dict[str, Any] = {
+                    "embeddings": db["embeddings"],
+                    "chunk_ids": db["chunk_ids"],
+                    "contents": db["contents"],
+                    "sources": db["sources"],
+                    "domains": db["domains"],
+                    "model": str(db["model"].item()),
+                    "dimension": int(db["dimension"].item()),
+                }
+        except (OSError, KeyError, ValueError):
+            return None
+        self._vector_cache = (key, data)
+        return data
 
     def _init_fts5(self):
         """Initialize FTS5 database."""
@@ -369,21 +409,16 @@ class Tier2Search:
     def search_vector(self, query: str, query_embedding: np.ndarray, limit: int = 10, domain: str = "general") -> list[dict]:
         """Vector cosine similarity search. ~10-30ms."""
         t0 = time.perf_counter()
-        # Load vector database
-        if not Path(VECTOR_DB_PATH).exists():
+        index = self._load_vector_index()
+        if index is None:
             return []
-
-        try:
-            with np.load(VECTOR_DB_PATH, allow_pickle=False) as db:
-                embeddings = db["embeddings"]
-                chunk_ids = db["chunk_ids"]
-                contents = db["contents"]
-                sources = db["sources"]
-                domains = db["domains"]
-                model = str(db["model"].item())
-                dimension = int(db["dimension"].item())
-        except (OSError, KeyError, ValueError):
-            return []
+        embeddings = index["embeddings"]
+        chunk_ids = index["chunk_ids"]
+        contents = index["contents"]
+        sources = index["sources"]
+        domains = index["domains"]
+        model = index["model"]
+        dimension = index["dimension"]
 
         if len(embeddings) == 0:
             return []
@@ -531,16 +566,21 @@ class JevRouter:
         self._total_ms = 0.0
 
     async def get_embedding(self, text: str) -> Optional[np.ndarray]:
-        """Get embedding vector for text. Returns None if embedding service unavailable."""
+        """Get an embedding vector, or None if the embedder cannot answer in budget.
+
+        None is a supported outcome, not an error: the caller skips the vector layer and
+        serves the local FTS results.
+        """
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    EMBEDDING_API,
-                    json={"model": EMBEDDING_MODEL, "input": text},
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            async with asyncio.timeout(EMBEDDING_TIMEOUT_S):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(EMBEDDING_TIMEOUT_S)) as client:
+                    resp = await client.post(
+                        EMBEDDING_API,
+                        json={"model": EMBEDDING_MODEL, "input": text},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
             embeddings = data.get("embeddings", [])
             if embeddings:
                 return np.array(embeddings[0])

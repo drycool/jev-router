@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -11,6 +12,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from api import server
+from core.env import load_env
 from core.decision_engine import DecisionEngineClient, DecisionEngineResult
 from core.laya_client import LayaDecision, LayaTier1Client, not_awaited
 from core.shadow import ShadowProbe
@@ -128,22 +130,26 @@ class RouterTests(unittest.TestCase):
                 router.tier2.close()
 
     def test_lightrag_failure_degrades_to_fts_context(self):
+        # The graph tier is pinned on explicitly. Importing api.server now loads the
+        # project's .env (see core/env.py), and a test must not change meaning depending on
+        # the developer's local configuration.
         with tempfile.TemporaryDirectory() as directory:
             with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
-                router = JevRouter()
-                router.tier2.index_chunk("one", "Raspberry unrelated")
-                router.tier2.commit()
-                async def no_embedding(_):
-                    return None
-                async def timed_out(*_, **__):
-                    return {"response": "", "error_type": "timeout"}
-                router.get_embedding = no_embedding
-                router.tier3.search = timed_out
-                result = asyncio.run(router.route("Raspberry Pi cable"))
-                self.assertTrue(result.degraded)
-                self.assertEqual(result.fallback_reason, "lightrag_timeout")
-                self.assertIn("Raspberry", result.context)
-                router.tier2.close()
+                with patch("core.router.LIGHTRAG_ENABLED", True):
+                    router = JevRouter()
+                    router.tier2.index_chunk("one", "Raspberry unrelated")
+                    router.tier2.commit()
+                    async def no_embedding(_):
+                        return None
+                    async def timed_out(*_, **__):
+                        return {"response": "", "error_type": "timeout"}
+                    router.get_embedding = no_embedding
+                    router.tier3.search = timed_out
+                    result = asyncio.run(router.route("Raspberry Pi cable"))
+                    self.assertTrue(result.degraded)
+                    self.assertEqual(result.fallback_reason, "lightrag_timeout")
+                    self.assertIn("Raspberry", result.context)
+                    router.tier2.close()
 
     def test_laya_direct_command_cannot_bypass_regex_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -275,6 +281,75 @@ class RouterTests(unittest.TestCase):
                     self.assertFalse(result.rag_configuration.lightrag_required)
                     self.assertLess(elapsed, 0.5)
                     router.tier2.close()
+
+    def test_vector_index_is_read_once_not_per_request(self):
+        """Loading the archive on every request cost ~310 ms of blocked event loop while
+        the cosine search itself takes ~13 ms - and being synchronous, that load also
+        delayed the classifier's own timeout."""
+        with tempfile.TemporaryDirectory() as directory:
+            vector_path = Path(directory) / "vectors.npz"
+            np.savez(
+                vector_path,
+                embeddings=np.array([[1.0, 0.0]]),
+                chunk_ids=np.array(["one"]), contents=np.array(["content"]), sources=np.array([""]),
+                domains=np.array(["general"]),
+                model=np.array("mxbai-embed-large"), dimension=np.array(2),
+            )
+            with patch("core.router.VECTOR_DB_PATH", str(vector_path)):
+                with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                    search = Tier2Search()
+                    real_load = np.load
+                    reads = []
+
+                    def counting_load(*args, **kwargs):
+                        reads.append(args[0] if args else kwargs.get("file"))
+                        return real_load(*args, **kwargs)
+
+                    with patch("core.router.np.load", counting_load):
+                        for _ in range(3):
+                            search.search_vector("q", np.array([1.0, 0.0]))
+
+                    self.assertEqual(len(reads), 1, "the index must be read once, not per request")
+                    search.close()
+
+    def test_embedding_call_is_bounded_by_its_budget(self):
+        """A stalling embedder must cost the budget, not the client default.
+
+        The embedder runs on the node that powers itself off when idle, and it is now the
+        fall-through path's only remaining GPU dependency. Under the previous 30 s client
+        timeout a sleeping node stalled a request for almost that long (~16 s observed
+        while the box was coming up). Here the endpoint accepts the connection and then
+        never answers - exactly what a sleeping node presents - and the call must still
+        give up inside its budget so the local FTS results get served.
+        """
+
+        async def scenario():
+            async def handle(reader, writer):
+                await asyncio.sleep(30)  # accept, then say nothing
+
+            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            try:
+                with tempfile.TemporaryDirectory() as directory:
+                    with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                        router = JevRouter()
+                        with patch("core.router.EMBEDDING_API",
+                                   f"http://127.0.0.1:{port}/api/embed"):
+                            with patch("core.router.EMBEDDING_TIMEOUT_S", 0.3):
+                                started = time.perf_counter()
+                                vector = await router.get_embedding("anything")
+                                elapsed = time.perf_counter() - started
+                        router.tier2.close()
+            finally:
+                # Server.wait_closed() waits for open handlers on Python 3.12+, and this
+                # handler is deliberately stalled; closing is enough, because asyncio.run
+                # cancels whatever is left on exit.
+                server.close()
+            return vector, elapsed
+
+        vector, elapsed = asyncio.run(scenario())
+        self.assertIsNone(vector, "a stalled embedder must degrade, not raise")
+        self.assertLess(elapsed, 2.0, "the budget must cut the call short")
 
     def test_stats_exposes_observability_counters(self):
         client = TestClient(server.app)
@@ -582,3 +657,34 @@ class LayaClientTests(unittest.TestCase):
         self.assertEqual(decision.checkpoint, "multilingual")
         self.assertEqual(decision.routing_reason, "non-Latin script (cyrillic)")
         self.assertEqual(decision.to_dict()["checkpoint"], "multilingual")
+
+
+class EnvLoaderTests(unittest.TestCase):
+    def test_dotenv_values_load_but_do_not_override_the_environment(self):
+        """`.env` was documented but never read, so editing it did nothing at all.
+
+        Real environment variables must still win: an operator exporting a value for one
+        run should not have it silently overridden by a checked-in file.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "# a comment\n"
+                "\n"
+                "JEV_TEST_PLAIN=value\n"
+                'JEV_TEST_QUOTED="http://127.0.0.1:8030"\n'
+                "export JEV_TEST_EXPORTED=exported\n"
+                "JEV_TEST_EXISTING=from_file\n"
+                "NOT_A_ASSIGNMENT\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"JEV_TEST_EXISTING": "from_environment"}, clear=False):
+                applied = load_env(path)
+                self.assertEqual(os.environ["JEV_TEST_PLAIN"], "value")
+                self.assertEqual(os.environ["JEV_TEST_QUOTED"], "http://127.0.0.1:8030")
+                self.assertEqual(os.environ["JEV_TEST_EXPORTED"], "exported")
+                self.assertEqual(os.environ["JEV_TEST_EXISTING"], "from_environment")
+                self.assertIn("JEV_TEST_PLAIN", applied)
+                self.assertNotIn("JEV_TEST_EXISTING", applied)
+            for key in ("JEV_TEST_PLAIN", "JEV_TEST_QUOTED", "JEV_TEST_EXPORTED"):
+                os.environ.pop(key, None)

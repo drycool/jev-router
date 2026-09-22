@@ -228,6 +228,10 @@ only, not a model reload.
 
 All runtime configuration is environment-based. Start from `.env.example`.
 
+Configuration comes from the environment, and `.env` in the project root is loaded at startup
+by `core/env.py`. A variable already present in the process environment wins, so
+`JEV_X=... python3 -m api.server` overrides the file for a single run.
+
 Important variables:
 
 - `JEV_LIGHTRAG_API` - LightRAG HTTP endpoint.
@@ -235,6 +239,7 @@ Important variables:
 - `JEV_LIGHTRAG_CHUNKS_PATH` - source `kv_store_text_chunks.json` used to rebuild FTS5 on startup.
 - `JEV_LLM_HOST` and `JEV_LLM_MODEL` - Ollama-compatible generation endpoint and model.
 - `JEV_EMBEDDING_API` and `JEV_EMBEDDING_MODEL` - embedding endpoint/model for vector search.
+- `JEV_VECTOR_TIMEOUT_S` - total budget for the embedding call, enforced with `asyncio.timeout`. On expiry the vector layer is skipped and the local FTS results are served, which is the same outcome as an unreachable embedder.
 - `JEV_LAYA_URL` - optional remote Laya classifier endpoint.
 - `JEV_LAYA_TIMEOUT_S` - total budget for that classifier, enforced with `asyncio.timeout`. Locally answered queries never await it; this bounds what it can add to a fall-through.
 - `JEV_LAYA_CONFIDENCE_THRESHOLD` - confidence the shipped preset `task` signal must reach before a verdict counts as accepted. It does not gate the hand-written `strategy`/`domain` questions.
@@ -304,6 +309,12 @@ python3 scripts/build_vector_index.py \
 ```
 
 The router rejects stale vector indexes when the embedding model or vector dimension does not match.
+
+The vector index is loaded once and cached in memory, re-read only when the file changes on
+disk (mtime + size), so rebuilding it does not require a restart. Loading it per request cost
+~310 ms of blocked event loop on this hardware while the cosine search itself takes ~13 ms —
+and because the load is synchronous, it also delayed timer callbacks, which is why the
+classifier's 150 ms budget was observed firing at ~420 ms.
 
 ## Observability
 
