@@ -13,6 +13,9 @@ __pycache__/
 *.log
 *.pid
 jev_decisions.jsonl
+# Benchmark outputs embed raw queries; keep them local like the decision log.
+laya_benchmark.jsonl
+decision_benchmark.jsonl
 
 storage/*.db
 storage/*.db-*

@@ -18,10 +18,15 @@ Core components:
 - `core/router.py` - routing pipeline, FTS5/vector retrieval, LightRAG fallback handling.
 - `core/laya_client.py` - optional remote Laya/System-1 classifier client with strict timeout.
 - `core/decision_engine.py` - optional llama.cpp-style decision endpoint client.
+- `core/shadow.py` - fire-and-forget shadow probes for candidate engines (never touch routing).
 - `agents/base.py` - general, code, DB, and troubleshooting agents.
 - `api/server.py` - FastAPI service and observability endpoints.
 - `scripts/build_vector_index.py` - builds the optional `.npz` vector index from LightRAG chunks.
-- `deploy/gpu2_laya_service.py` - optional GPU-side Laya inference service.
+- `scripts/benchmark_laya.py` - scores the Laya tier against a labeled fixture.
+- `deploy/gpu2_laya_service.py` - the GPU-side Laya inference service (`:8031`).
+- `deploy/laya-ctl.sh` - start/stop/status/warmup/lease helper for that service.
+- `deploy/fetch-model.sh` - resumable checkpoint download for a slow HF link.
+- `deploy/idle-shutdown.sh` - the GPU2 idle watchdog, lease-aware.
 
 ## Features
 
@@ -32,7 +37,8 @@ Core components:
 - JSONL decision logging for future evaluation or router distillation.
 - Prometheus-compatible `/metrics` endpoint.
 - Diagnostic `/decision-test` endpoint for evaluating a llama.cpp-style decision layer without changing production routing.
-- Regression tests for routing, fallback, vector-index validation, and API diagnostics.
+- **Shadow mode** (`core/shadow.py`): probe a candidate engine on live traffic without letting it steer routing, so it can be judged on real requests instead of a demo.
+- Regression tests for routing, fallback, vector-index validation, shadow probes, and API diagnostics.
 
 ## Quick Start
 
@@ -75,6 +81,115 @@ curl -X POST http://127.0.0.1:8030/decision-test \
 
 This endpoint is intentionally diagnostic: it records metrics and fallback behavior, but it does not alter `/query` routing.
 
+## Shadow Mode
+
+A candidate engine can be probed on live traffic without being allowed to steer anything:
+
+```bash
+export JEV_SHADOW_MODE=laya          # or: decision
+export JEV_SHADOW_URL=http://192.168.11.87:8031   # defaults per target
+export JEV_SHADOW_MAX_INFLIGHT=1
+python3 -m api.server --port 8030
+```
+
+Per request, `core/shadow.py` schedules one background probe and returns immediately. The probe:
+
+- never raises into the request path and never changes the response;
+- is capped at `JEV_SHADOW_MAX_INFLIGHT` concurrent calls — extra work is *skipped and counted*, not queued, so bursts cannot pile up;
+- treats an engine's own fallback answer (`status` other than `success`) as an `unavailable` observation rather than a usable one, so a sleeping GPU cannot flatter the numbers;
+- writes `{"event": "shadow", ...}` into `jev_decisions.jsonl` and feeds `/stats` + `/metrics`.
+
+```bash
+curl -s http://127.0.0.1:8030/stats | python3 -m json.tool | sed -n '/shadow/,$p'
+curl -s http://127.0.0.1:8030/metrics | grep jev_shadow
+```
+
+## The Laya System-1 Tier (GPU2)
+
+`deploy/gpu2_laya_service.py` exposes Laya over HTTP on `:8031`; the gateway calls it
+inline inside `core/router.py`. It never imports PyTorch itself — a slow or dead GPU
+must not endanger the Pi's routing loop.
+
+```bash
+# on GPU2
+./deploy/laya-ctl.sh start      # takes a watchdog lease first
+./deploy/laya-ctl.sh wait       # blocks until /health says the model is loaded
+./deploy/laya-ctl.sh warmup     # pay the first-call CUDA cost before a benchmark
+./deploy/laya-ctl.sh status
+./deploy/laya-ctl.sh hold       # extend the lease so the idle watchdog spares the box
+```
+
+`laya-ctl.sh predict "<query>"` runs a single prediction; `POST /schema` returns the exact
+question schema being sent.
+
+### Measured on this hardware (RTX 3060 12 GB, 2026-09-22)
+
+Two checkpoints are preloaded through `laya.Router`, which picks one per request from the
+detected script. `scripts/benchmark_laya.py` produced this on the 21-query fixture:
+
+```text
+model            answ    strat   domain  conf med   ≥thr   p50 ms   p95 ms
+--------------------------------------------------------------------------
+english         21/21    66.7%    61.9%       0.1   0.0%     57.9     62.3
+multilingual    21/21    33.3%    33.3%       0.5  23.8%     28.6     32.1
+regex local         -        -   100.0%         -      -        -        -
+```
+
+Read this honestly:
+
+- **Latency** — the multilingual checkpoint answers in ~29 ms (p95 32 ms), comfortably inside
+  the budget. The English checkpoint costs ~2x (~58/62 ms) and would *always* exceed a 50 ms
+  client timeout, which is why `JEV_LAYA_TIMEOUT_S` is 0.15 rather than 0.05.
+- **The gateway's own round trip is ~28.6 ms p50 / 29.4 ms max** measured from the Pi
+  (`LayaTier1Client`). Two fixes were needed to get there, both found by measuring rather than
+  reasoning:
+  - `httpx.Timeout` is *not* a total deadline — it applies per socket read, so a 50 ms setting
+    was observed returning after 181 ms. The budget is now enforced with `asyncio.timeout`.
+  - the client opened a new TCP connection per call, which cost ~15 ms of the round trip; it now
+    pools one connection. Before that, e2e p50 was 44 ms instead of 29 ms.
+- **The local regex beats the model at subject domain** (100% vs 33%). Both models answer
+  `raspberry_pi` for almost everything, including a car-engine question. Subject domain is not
+  what this checkpoint is trained to decide — keep `detect_domain()` for it.
+- **`strat`/`domain` accuracy above is measured against labels that are themselves debatable**
+  (several retrieval-strategy labels are arguable). Treat it as a smoke test, not a verdict.
+- Adding the preset block cost ~12 ms of inference (27.6 → 39 ms average across mixed
+  checkpoints); it is still one forward pass, just more head tokens.
+
+### Why our own taxonomy had to be replaced
+
+The checkpoint is trained with RL against specific workflows. Asking it our invented
+`strategy`/`domain` labels on Russian traffic produced confidences of 0.003–0.37 with
+near-random answers — and one confidently wrong answer (`raspberry_pi` at probability 0.9995
+for "rewrite the router in Go"). The same model, asked the *shipped* preset
+(`laya.router_questions()`), answered `code` at 0.926 and `chitchat` at 0.988 on the same
+queries. Evidence and method: `docs/laya-preset-vs-custom-20260922.txt`.
+
+The service therefore sends both blocks and returns both: the shipped preset (`difficulty`,
+`task`, `needs_tools`, `is_sensitive`) plus the Jev-specific labels. **Use the preset signals
+to drive the strategy decision; do not invent new taxonomies for this model.**
+
+### Routing a non-English deployment
+
+The repo root is the English checkpoint (ModernBERT-large); `multilingual` is a bundled
+subfolder (mmBERT-base, 100+ languages). The English checkpoint does not degrade gracefully
+off English — it collapses while staying confident, so gating on confidence cannot catch it.
+Both are preloaded (`LAYA_PRELOAD=english,multilingual`) so a language flip costs detection
+only, not a model reload.
+
+### Operations on GPU2
+
+- `deploy/idle-shutdown.sh` is the idle watchdog. It now honours a **lease**
+  (`~/logs/activity.lease`), which the Laya service refreshes on every `/predict` and
+  deployments refresh explicitly via `laya-ctl.sh hold`. It also counts established inbound
+  SSH connections (utmp misses non-interactive `ssh host cmd`) and long installs running
+  outside any SSH session, and it treats recognised model servers as idle while they merely
+  hold VRAM. Without the lease, a `tmux`-based install looks idle and the box powers off
+  mid-deployment.
+- `deploy/fetch-model.sh` downloads a checkpoint resumably. The HF link here runs at
+  ~0.7 MB/s and xet stalls on the last file, so one attempt is allowed to run for 30 minutes;
+  a short timeout looks like "downloading 0 bytes" while the network is saturated.
+
+
 ## Configuration
 
 All runtime configuration is environment-based. Start from `.env.example`.
@@ -86,7 +201,11 @@ Important variables:
 - `JEV_LLM_HOST` and `JEV_LLM_MODEL` - Ollama-compatible generation endpoint and model.
 - `JEV_EMBEDDING_API` and `JEV_EMBEDDING_MODEL` - embedding endpoint/model for vector search.
 - `JEV_LAYA_URL` - optional remote Laya classifier endpoint.
+- `JEV_LAYA_TIMEOUT_S` - call budget for that classifier; also the worst-case latency it can add, since the call is inline in the routing path.
+- `JEV_LAYA_CONFIDENCE_THRESHOLD` - confidence a Laya verdict must reach before it may change routing.
 - `JEV_DECISION_ENGINE_URL` - optional llama.cpp-style `/v1/decision` endpoint.
+- `JEV_SHADOW_MODE` - `off` (default), `laya`, or `decision`; what to probe in the background.
+- `JEV_SHADOW_URL`, `JEV_SHADOW_TIMEOUT_S`, `JEV_SHADOW_MAX_INFLIGHT`, `JEV_SHADOW_SAMPLE_RATE` - shadow probe controls.
 - `JEV_LOG_RAW_QUERY` - keep `false` unless raw user prompts are intentionally logged.
 
 ## Indexes
@@ -110,16 +229,33 @@ The router rejects stale vector indexes when the embedding model or vector dimen
 
 ## Observability
 
-- `GET /stats` - JSON counters for requests, tiers, degraded requests, agent errors, and Laya decisions.
-- `GET /metrics` - Prometheus text exposition.
+- `GET /stats` - JSON counters for requests, tiers, degraded requests, agent errors, Laya decisions, and shadow probes.
+- `GET /metrics` - Prometheus text exposition, including `jev_shadow_*` families.
 - `POST /decision-test` - safe probe for the optional decision engine.
-- `jev_decisions.jsonl` - privacy-preserving decision log using query hashes by default.
+- `jev_decisions.jsonl` - privacy-preserving decision log using query hashes by default; shadow observations are appended as `{"event": "shadow", ...}`.
+
+Each routing event also records `execution.laya_accepted`, i.e. whether the System-1 verdict
+would have cleared `JEV_LAYA_CONFIDENCE_THRESHOLD`. That counter is what tells you whether the
+threshold is calibrated rather than merely strict.
+
+## Benchmarking the Laya tier
+
+```bash
+python3 scripts/benchmark_laya.py --include-baseline                      # routed
+python3 scripts/benchmark_laya.py --models english multilingual --repeat 3 # A/B checkpoints
+```
+
+It scores strategy and domain accuracy separately, the confidence distribution, how often the
+threshold is cleared, latency p50/p95, which checkpoint answered, and the full confusion table.
+Every disagreement is printed — a caller cannot be misled by a tidy summary. Add
+`--include-baseline` to score the local regex domain classifier on the same fixture, which is
+the comparison that matters.
 
 ## Development
 
 ```bash
 python3 -m unittest discover -v
-python3 -m py_compile core/router.py core/decision_engine.py api/server.py tests/test_router.py
+python3 -m py_compile core/router.py core/decision_engine.py core/shadow.py api/server.py scripts/benchmark_laya.py tests/test_router.py
 ```
 
 ## Publication Notes
