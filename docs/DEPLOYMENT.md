@@ -1,11 +1,11 @@
 # Deployment
 
-## Jev API
+## jev-router API
 
 Example `tmux` launch:
 
 ```bash
-tmux new-session -d -s jev "cd /path/to/Jev && source .venv/bin/activate && python3 -m api.server --port 8030"
+tmux new-session -d -s jev "cd /path/to/jev-router && source .venv/bin/activate && python3 -m api.server --port 8030"
 ```
 
 Stop:
@@ -22,7 +22,7 @@ tmux capture-pane -t jev -p
 
 ## Optional Laya Service
 
-The Laya service is optional and intended for a GPU host. Jev treats it as advisory only: direct command execution remains gated by deterministic router rules.
+The Laya service is optional and intended for a GPU host. `jev-router` treats it as advisory only: direct command execution remains gated by deterministic router rules.
 
 Install the GPU host dependencies separately, then run:
 

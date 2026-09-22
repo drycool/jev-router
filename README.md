@@ -1,6 +1,6 @@
-# Jev
+# jev-router
 
-Jev is a lightweight multi-tier routing gateway for RAG and agent workflows. It is designed to answer simple requests locally, use fast text/vector retrieval when possible, and escalate only harder questions to LightRAG and an LLM-backed agent.
+`jev-router` is a lightweight multi-tier routing gateway for RAG and agent workflows. It is designed to answer simple requests locally, use fast text/vector retrieval when possible, and escalate only harder questions to LightRAG and an LLM-backed agent.
 
 ## Architecture
 
@@ -111,3 +111,16 @@ python3 -m py_compile core/router.py api/server.py tests/test_router.py
 ## Publication Notes
 
 Do not publish local `.env`, generated indexes, logs, or decision JSONL files. They may contain local paths, operational metadata, or private context.
+
+The intended GitHub repository is:
+
+```text
+https://github.com/drycool/jev-router
+```
+
+Publish from this local checkout:
+
+```bash
+git remote add origin https://github.com/drycool/jev-router.git
+git push -u origin main
+```
