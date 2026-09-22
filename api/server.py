@@ -11,9 +11,11 @@ import json
 import logging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from typing import cast
 
 import uvicorn
 from fastapi import FastAPI, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.decision_engine import (
@@ -22,8 +24,9 @@ from core.decision_engine import (
     DECISION_SCHEMAS,
     DecisionEngineClient,
 )
-from core.laya_client import LAYA_CONFIDENCE_THRESHOLD
+from core.laya_client import LAYA_CONFIDENCE_THRESHOLD, LAYA_URL
 from core.router import AgentType, JevRouter, RoutingResult, Strategy
+from core.shadow import ShadowProbe, ShadowTarget
 from agents.base import (
     GeneralAgent, CodeAgent, DBAgent, TroubleshooterAgent,
     AgentResponse,
@@ -42,6 +45,19 @@ LIGHTRAG_CHUNKS_PATH = os.getenv(
 )
 LOG_RAW_QUERY = os.getenv("JEV_LOG_RAW_QUERY", "false").lower() == "true"
 
+# ── Shadow mode ───────────────────────────────────────────────────────
+# A candidate decision engine probed on real traffic, off the request path.
+# "off" is the default: nothing is probed until someone opts in per target.
+SHADOW_MODE = os.getenv("JEV_SHADOW_MODE", "off").strip().lower()
+if SHADOW_MODE not in {"off", "laya", "decision"}:
+    print(f"[Jev] unknown JEV_SHADOW_MODE={SHADOW_MODE!r}; shadow probes disabled")
+    SHADOW_MODE = "off"
+SHADOW_DEFAULT_URL = {"laya": LAYA_URL, "decision": DECISION_ENGINE_URL}.get(SHADOW_MODE, "")
+SHADOW_URL = os.getenv("JEV_SHADOW_URL") or SHADOW_DEFAULT_URL
+SHADOW_TIMEOUT_S = float(os.getenv("JEV_SHADOW_TIMEOUT_S", "1.0"))
+SHADOW_MAX_INFLIGHT = int(os.getenv("JEV_SHADOW_MAX_INFLIGHT", "1"))
+SHADOW_SAMPLE_RATE = float(os.getenv("JEV_SHADOW_SAMPLE_RATE", "1.0"))
+
 decision_logger = logging.getLogger("jev.decisions")
 decision_logger.setLevel(logging.INFO)
 if not decision_logger.handlers:
@@ -54,6 +70,44 @@ if not decision_logger.handlers:
 # ── Lifespan ──────────────────────────────────────────────────────────
 router: JevRouter = None
 decision_engine = DecisionEngineClient()
+
+
+def _record_shadow(event: dict) -> None:
+    """Persist one shadow observation and fold it into the live counters.
+
+    Shadow probes are the only place a candidate engine's own answer is recorded,
+    so the counters here are what a promotion decision gets argued from.
+    """
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "shadow",
+        **event,
+    }
+    decision_logger.info(json.dumps(payload, ensure_ascii=False))
+
+    _stats["shadow_requests"] += 1
+    _stats["shadow_latency_ms"] += float(event.get("latency_ms", 0.0))
+    status = str(event.get("status", "error"))
+    if status != "success":
+        _stats["shadow_errors"] += 1
+    if status == "timeout":
+        _stats["shadow_timeouts"] += 1
+    if event.get("low_confidence"):
+        _stats["shadow_low_confidence"] += 1
+    choice = event.get("choice")
+    if choice:
+        _stats["shadow_choices"][str(choice)] = _stats["shadow_choices"].get(str(choice), 0) + 1
+
+
+shadow_probe = ShadowProbe(
+    target=cast(ShadowTarget, SHADOW_MODE),
+    url=SHADOW_URL,
+    timeout_s=SHADOW_TIMEOUT_S,
+    max_inflight=SHADOW_MAX_INFLIGHT,
+    sample_rate=SHADOW_SAMPLE_RATE,
+    low_confidence_threshold=DECISION_ENGINE_LOW_CONFIDENCE,
+    on_result=_record_shadow,
+)
 
 
 @asynccontextmanager
@@ -81,6 +135,8 @@ async def lifespan(app: FastAPI):
     await _index_lightrag_chunks()
 
     yield
+    await shadow_probe.aclose()
+    await router.laya.aclose()
     router.tier2.close()
 
 
@@ -158,6 +214,13 @@ class StatsResponse(BaseModel):
     decision_engine_errors: int
     decision_engine_low_confidence: int
     decision_engine_latency_ms: float
+    shadow_requests: int
+    shadow_errors: int
+    shadow_timeouts: int
+    shadow_low_confidence: int
+    shadow_latency_ms_avg: float
+    shadow_choices: dict[str, int]
+    shadow: dict
 
 
 class DecisionTestRequest(BaseModel):
@@ -206,7 +269,26 @@ _stats = {
     "decision_engine_errors": 0,
     "decision_engine_low_confidence": 0,
     "decision_engine_latency_ms": 0.0,
+    "shadow_requests": 0,
+    "shadow_errors": 0,
+    "shadow_timeouts": 0,
+    "shadow_low_confidence": 0,
+    "shadow_latency_ms": 0.0,
+    "shadow_choices": {},
 }
+
+
+def _laya_accepted(result: RoutingResult) -> bool:
+    """Whether the GPU2 classifier's verdict cleared the acceptance threshold.
+
+    Recorded per request because "how often would the System-1 tier have been
+    trusted?" is the number that decides whether its threshold is calibrated.
+    """
+    laya = result.laya_result or {}
+    return (
+        laya.get("status") == "success"
+        and float(laya.get("confidence", 0.0)) >= LAYA_CONFIDENCE_THRESHOLD
+    )
 
 
 def _record_decision(query: str, result: RoutingResult, elapsed_ms: float, agent_error: bool = False) -> None:
@@ -226,6 +308,7 @@ def _record_decision(query: str, result: RoutingResult, elapsed_ms: float, agent
             "degraded": result.degraded,
             "fallback_reason": result.fallback_reason,
             "agent_error": agent_error,
+            "laya_accepted": _laya_accepted(result),
             "decision_engine_used": False,
             "decision_engine_candidate_count": 0,
             "decision_engine_confidence": None,
@@ -249,6 +332,15 @@ async def health():
         "llm_host": LLM_HOST,
         "decision_engine_url": DECISION_ENGINE_URL,
         "decision_schemas": sorted(DECISION_SCHEMAS),
+        "shadow": {
+            "mode": SHADOW_MODE,
+            "enabled": shadow_probe.enabled,
+            "url": SHADOW_URL or None,
+            "timeout_s": SHADOW_TIMEOUT_S,
+            "max_inflight": SHADOW_MAX_INFLIGHT,
+            "sample_rate": SHADOW_SAMPLE_RATE,
+            "requests": _stats["shadow_requests"],
+        },
     }
 
 
@@ -262,6 +354,11 @@ async def query(req: QueryRequest):
 
     # Tier 1-3: Route
     result: RoutingResult = await router.route(req.query)
+
+    # Shadow probe: dispatched off the request path.  It is scheduled here, after
+    # routing, so it overlaps Tier 4 and never adds latency to this response —
+    # failures are counted, not raised.
+    shadow_probe.submit(req.query, context=result.context[:2000] if result.context else "")
 
     # Track stats
     if result.routing_decision.strategy == Strategy.DIRECT_ACTION:
@@ -340,6 +437,15 @@ async def stats():
         decision_engine_errors=_stats["decision_engine_errors"],
         decision_engine_low_confidence=_stats["decision_engine_low_confidence"],
         decision_engine_latency_ms=round(_stats["decision_engine_latency_ms"], 2),
+        shadow_requests=_stats["shadow_requests"],
+        shadow_errors=_stats["shadow_errors"],
+        shadow_timeouts=_stats["shadow_timeouts"],
+        shadow_low_confidence=_stats["shadow_low_confidence"],
+        shadow_latency_ms_avg=round(
+            _stats["shadow_latency_ms"] / max(_stats["shadow_requests"], 1), 2
+        ),
+        shadow_choices=dict(_stats["shadow_choices"]),
+        shadow=shadow_probe.stats(),
     )
 
 
@@ -370,7 +476,27 @@ async def metrics():
         "# TYPE jev_decision_engine_latency_ms_total counter",
         f'jev_decision_engine_latency_ms_total {_stats["decision_engine_latency_ms"]:.3f}',
     ]
-    from fastapi.responses import PlainTextResponse
+
+    # Shadow probes: what a candidate engine would have answered on live traffic.
+    probe = shadow_probe.stats()
+    target = str(probe["target"])
+    lines += [
+        "# TYPE jev_shadow_enabled gauge",
+        f'jev_shadow_enabled{{target="{target}"}} {1 if probe["enabled"] else 0}',
+        "# TYPE jev_shadow_requests_total counter",
+        f'jev_shadow_requests_total{{target="{target}",status="success"}} {probe["success"]}',
+        f'jev_shadow_requests_total{{target="{target}",status="timeout"}} {probe["timeout"]}',
+        f'jev_shadow_requests_total{{target="{target}",status="unavailable"}} {probe["unavailable"]}',
+        f'jev_shadow_requests_total{{target="{target}",status="error"}} {probe["error"]}',
+        "# TYPE jev_shadow_low_confidence_total counter",
+        f'jev_shadow_low_confidence_total{{target="{target}"}} {probe["low_confidence"]}',
+        "# TYPE jev_shadow_skipped_total counter",
+        f'jev_shadow_skipped_total{{target="{target}",reason="busy"}} {probe["skipped_busy"]}',
+        "# TYPE jev_shadow_latency_ms_total counter",
+        f'jev_shadow_latency_ms_total{{target="{target}"}} {_stats["shadow_latency_ms"]:.3f}',
+    ]
+    for choice, count in sorted(probe["choices"].items()):
+        lines.append(f'jev_shadow_choice_total{{target="{target}",choice="{choice}"}} {count}')
     return PlainTextResponse("\n".join(lines) + "\n")
 
 
