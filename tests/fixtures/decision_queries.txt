@@ -1,0 +1,40 @@
+# Labeled routing fixture for scripts/benchmark_laya.py — TSV, one query per line:
+#
+#   query <TAB> expected_strategy <TAB> expected_domain
+#
+# Use "-" for a field that should not be scored.  Labels are deliberately
+# conservative: only queries whose intended route is unambiguous are listed, so a
+# disagreement is evidence about the model rather than about the labelling.
+# Strategies: direct_cmd | database_search | graph_lightrag | complex_llm
+# Domains:    raspberry_pi | automotive | general
+#
+# The traffic this router actually serves is Russian, so Russian queries dominate.
+
+# ── raspberry_pi ────────────────────────────────────────────────────────
+Какие кабели обсуждались для Raspberry Pi 5?	graph_lightrag	raspberry_pi
+Какой блок питания нужен для Raspberry Pi 5 с NVMe?	graph_lightrag	raspberry_pi
+Подойдёт ли Argon ONE V3 для Pi 5 с двумя SSD?	graph_lightrag	raspberry_pi
+Что известно про micro-HDMI на Pi 5?	graph_lightrag	raspberry_pi
+Сколько ОЗУ у Raspberry Pi 5 в старшей версии?	graph_lightrag	raspberry_pi
+Как настроить GPIO на Raspberry Pi?	graph_lightrag	raspberry_pi
+
+# ── automotive ──────────────────────────────────────────────────────────
+Почему двигатель Espero троит на холодную?	complex_llm	automotive
+Какие свечи подходят на Daewoo Espero?	graph_lightrag	automotive
+Как проверить ошибки ECU на Espero?	graph_lightrag	automotive
+Что означает код ошибки K-line на Espero?	graph_lightrag	automotive
+Где находится реле зажигания у Espero?	database_search	automotive
+
+# ── general ─────────────────────────────────────────────────────────────
+Запусти проверку статуса	direct_cmd	general
+Перезапусти сервис ollama	direct_cmd	general
+Покажи свободное место на диске	direct_cmd	general
+Перепиши роутер на Go	complex_llm	general
+Объясни, почему падает сервис под нагрузкой	complex_llm	general
+Привет, как дела?	complex_llm	general
+Что такое BM25?	graph_lightrag	general
+
+# ── English controls (the English checkpoint's home turf) ───────────────
+Run a status check	direct_cmd	general
+Which cables were discussed for the Raspberry Pi 5?	graph_lightrag	raspberry_pi
+Why does the Espero engine misfire when cold?	complex_llm	automotive

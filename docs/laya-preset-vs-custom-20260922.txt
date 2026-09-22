@@ -1,0 +1,30 @@
+# Evidence: shipped preset vs our custom taxonomy (GPU2, RTX 3060, 2026-09-22)
+#
+# Method: same Russian queries, same Laya 0.3.5 runtime, multilingual checkpoint.
+# The preset block answers correctly and confidently; the custom block does not.
+
+schema: laya.router_questions() — domain is the shipped 6-way preset
+domain            conf difficulty needs_tools  query
+------------------------------------------------------------------------------------------------
+code             0.869       0.92        0.55  Запусти проверку статуса
+code             0.770       0.51        0.69  Проверь свободное место на диске
+code             0.364       1.74        0.44  Какие кабели обсуждались для Raspberry Pi 5?
+code             0.566       0.35        0.76  Какой блок питания нужен для Raspberry Pi 5 с NVMe?
+code             0.626       1.16        0.02  Почему двигатель Espero троит на холодную?
+code             0.590       0.16        0.14  Где находится реле зажигания у Espero?
+code             0.926       1.21        0.22  Перепиши роутер на Go
+math_or_logic    0.485       1.73        0.28  Объясни, почему падает сервис под нагрузкой
+chitchat         0.988       1.17        0.00  Привет, как дела?
+math_or_logic    0.759       0.32        0.02  Что такое BM25?
+
+domain probabilities per query (position bias check):
+  Запусти проверку статуса                       code=0.96, math_or_logic=0.00, writing=0.01, factual_lookup=0.01, data_analysis=0.02, chitchat=0.01
+  Проверь свободное место на диске               code=0.92, math_or_logic=0.02, writing=0.02, factual_lookup=0.02, data_analysis=0.01, chitchat=0.01
+  Какие кабели обсуждались для Raspberry Pi 5?   code=0.54, math_or_logic=0.12, writing=0.01, factual_lookup=0.30, data_analysis=0.02, chitchat=0.02
+  Какой блок питания нужен для Raspberry Pi 5    code=0.76, math_or_logic=0.03, writing=0.16, factual_lookup=0.03, data_analysis=0.00, chitchat=0.01
+  Почему двигатель Espero троит на холодную?     code=0.75, math_or_logic=0.22, writing=0.01, factual_lookup=0.01, data_analysis=0.00, chitchat=0.01
+  Где находится реле зажигания у Espero?         code=0.71, math_or_logic=0.27, writing=0.01, factual_lookup=0.01, data_analysis=0.00, chitchat=0.01
+  Перепиши роутер на Go                          code=0.98, math_or_logic=0.00, writing=0.02, factual_lookup=0.00, data_analysis=0.00, chitchat=0.00
+  Объясни, почему падает сервис под нагрузкой    code=0.46, math_or_logic=0.49, writing=0.01, factual_lookup=0.01, data_analysis=0.00, chitchat=0.03
+  Привет, как дела?                              code=0.00, math_or_logic=0.00, writing=0.00, factual_lookup=0.00, data_analysis=0.00, chitchat=1.00
+  Что такое BM25?                                code=0.00, math_or_logic=0.86, writing=0.00, factual_lookup=0.14, data_analysis=0.00, chitchat=0.00
