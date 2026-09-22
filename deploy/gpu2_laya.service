@@ -1,0 +1,15 @@
+[Unit]
+Description=Jev Laya Tier-1 inference service
+After=network-online.target
+
+[Service]
+Type=simple
+User=dry
+WorkingDirectory=/home/dry/jev-laya
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/dry/jev-laya/.venv/bin/uvicorn gpu2_laya_service:app --host 0.0.0.0 --port 8031
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
