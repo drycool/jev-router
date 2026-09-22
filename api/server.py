@@ -210,6 +210,7 @@ class StatsResponse(BaseModel):
     agent_errors: int
     laya_predictions: int
     laya_accepted: int
+    laya_not_awaited: int
     decision_engine_requests: int
     decision_engine_errors: int
     decision_engine_low_confidence: int
@@ -265,6 +266,7 @@ _stats = {
     "agent_errors": 0,
     "laya_predictions": 0,
     "laya_accepted": 0,
+    "laya_not_awaited": 0,
     "decision_engine_requests": 0,
     "decision_engine_errors": 0,
     "decision_engine_low_confidence": 0,
@@ -283,12 +285,21 @@ def _laya_accepted(result: RoutingResult) -> bool:
 
     Recorded per request because "how often would the System-1 tier have been
     trusted?" is the number that decides whether its threshold is calibrated.
+
+    Gated on the shipped-preset ``task`` signal only.  The service's
+    ``confidence`` is the minimum over two hand-written questions this
+    checkpoint was never trained on, so a confident-but-wrong verdict clears it -
+    which is exactly why raising that number was never going to help.
     """
     laya = result.laya_result or {}
     return (
         laya.get("status") == "success"
-        and float(laya.get("confidence", 0.0)) >= LAYA_CONFIDENCE_THRESHOLD
+        and float(laya.get("task_confidence", 0.0)) >= LAYA_CONFIDENCE_THRESHOLD
     )
+
+
+def _laya_status(result: RoutingResult) -> str:
+    return str((result.laya_result or {}).get("status", "absent"))
 
 
 def _record_decision(query: str, result: RoutingResult, elapsed_ms: float, agent_error: bool = False) -> None:
@@ -370,12 +381,14 @@ async def query(req: QueryRequest):
     if result.degraded:
         _stats["degraded"] += 1
     if result.laya_result:
-        _stats["laya_predictions"] += 1
-        if (
-            result.laya_result.get("status") == "success"
-            and result.laya_result.get("confidence", 0) >= LAYA_CONFIDENCE_THRESHOLD
-        ):
-            _stats["laya_accepted"] += 1
+        if _laya_status(result) == "not_awaited":
+            # The local path answered without waiting for GPU2.  Counting this as
+            # a prediction would make the classifier look busier than it is.
+            _stats["laya_not_awaited"] += 1
+        else:
+            _stats["laya_predictions"] += 1
+            if _laya_accepted(result):
+                _stats["laya_accepted"] += 1
 
     # Tier 4: Execute agent if requested
     agent_response = ""
@@ -433,6 +446,7 @@ async def stats():
         agent_errors=_stats["agent_errors"],
         laya_predictions=_stats["laya_predictions"],
         laya_accepted=_stats["laya_accepted"],
+        laya_not_awaited=_stats["laya_not_awaited"],
         decision_engine_requests=_stats["decision_engine_requests"],
         decision_engine_errors=_stats["decision_engine_errors"],
         decision_engine_low_confidence=_stats["decision_engine_low_confidence"],
@@ -465,6 +479,8 @@ async def metrics():
         f'jev_laya_predictions_total {_stats["laya_predictions"]}',
         "# TYPE jev_laya_accepted_total counter",
         f'jev_laya_accepted_total {_stats["laya_accepted"]}',
+        "# TYPE jev_laya_not_awaited_total counter",
+        f'jev_laya_not_awaited_total {_stats["laya_not_awaited"]}',
         "# TYPE jev_request_latency_ms_total counter",
         f'jev_request_latency_ms_total {_stats["total_ms"]:.3f}',
         "# TYPE jev_decision_engine_requests_total counter",

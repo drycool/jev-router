@@ -4,6 +4,7 @@ Jev Multi-Tier Router & Agentic Orchestrator
 Level 0: Ultra-Low Latency Request Routing
 4-Tier Pipeline: Fast Route → FTS/Vector → LightRAG → Agent
 """
+import asyncio
 import re
 import time
 import json
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Any
 
 import numpy as np
-from core.laya_client import LAYA_CONFIDENCE_THRESHOLD, LayaTier1Client
+from core.laya_client import LayaDecision, LayaTier1Client, not_awaited
 
 
 # ── Configuration ──────────────────────────────────────────────────────
@@ -260,6 +261,25 @@ def _is_fts_exact(query: str, result: dict) -> bool:
     content_terms = set(re.findall(r"\b[\wа-яА-ЯёЁ]+\b", result["content"].lower()))
     matches = sum(keyword.lower() in content_terms for keyword in keywords)
     return matches >= min(2, len(keywords))
+
+
+def _settled_laya(task: "asyncio.Task[LayaDecision]") -> dict:
+    """Read the classifier verdict if it already landed, else cancel the call.
+
+    Used on paths that must not wait for GPU2.  A fire-and-forget request that
+    nobody will read is not free: the GPU2 service scores one request at a time,
+    and leaving these in flight measurably queued them ahead of the requests that
+    *did* need a verdict - the fall-through path went from 55.6 ms to 120.4 ms
+    with half its calls timing out, purely from abandoned work.  Enrichment for
+    locally answered queries is what shadow mode is for.
+    """
+    if not task.done():
+        task.cancel()
+        return not_awaited().to_dict()
+    try:
+        return task.result().to_dict()
+    except (asyncio.CancelledError, Exception):
+        return not_awaited().to_dict()
 
 
 # ── Tier 2: FTS5 + Vector Search ─────────────────────────────────────
@@ -535,28 +555,27 @@ class JevRouter:
             self._total_ms += (time.perf_counter() - t0) * 1000
             return tier1_result
 
-        # Remote ML is advisory: exact rules retain command-execution
-        # authority. A timeout/unavailable GPU2 merely falls through to the
-        # deterministic retrieval pipeline.
-        laya = await self.laya.predict_routing(query)
-        laya_data = laya.to_dict()
-        laya_accepted = laya.status == "success" and laya.confidence >= LAYA_CONFIDENCE_THRESHOLD
-        domain = laya.domain if laya_accepted and laya.domain in {"raspberry_pi", "automotive", "general"} else detect_domain(query)
-        laya_strategy = laya.strategy if laya_accepted else "general_fallback"
-        # ML may recommend retrieval, but it never gains authority to execute
-        # commands. Direct execution remains exclusively rule-gated above.
-        if laya_strategy == "direct_cmd":
-            laya_data["execution_override"] = "direct_cmd_requires_regex_match"
-            laya_strategy = "general_fallback"
-        target_agent = AgentType.DB if laya_strategy == "database_search" else AgentType.GENERAL
+        # Remote ML is advisory: exact rules retain both retrieval and
+        # command-execution authority.  The GPU2 round trip is *started* here so
+        # that it overlaps the local index lookup, but it is awaited only if the
+        # local path cannot answer on its own.  Measured on an exactly answerable
+        # query: route() took 56.0 ms, of which 55.3 ms was this classifier, and
+        # the answer that came back did not use the verdict at all.
+        laya_task = asyncio.create_task(self.laya.predict_routing(query))
+        # The subject domain is decided locally and only locally.  The
+        # classifier's own domain question is hand-written rather than trained
+        # for, and measured 33.3% against 100% for this rule.
+        domain = detect_domain(query)
 
         # ── Tier 2: FTS5 + Vector search ──
         # FTS is local and is deliberately attempted before embedding.  Calling
         # the embedding server first made an exact local hit wait for the
         # network on every request, defeating the early-exit design.
         fts_results = self.tier2.search_fts5(query)
-        fts_exact = [] if laya_strategy == "graph_lightrag" else [r for r in fts_results if _is_fts_exact(query, r)]
+        fts_exact = [r for r in fts_results if _is_fts_exact(query, r)]
         if fts_exact:
+            # Nothing in this answer needs the classifier, so nothing here waits
+            # for it: the verdict rides along only if it already arrived.
             context = "\n\n".join(r["content"] for r in fts_exact[:3])
             return RoutingResult(
                 routing_decision=RoutingDecision(
@@ -572,11 +591,11 @@ class JevRouter:
                     lightrag_required=False,
                     lightrag_mode="skip",
                 ),
-                target_agent=target_agent,
+                target_agent=AgentType.GENERAL,
                 query=query,
                 context=context,
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
-                laya_result=laya_data,
+                laya_result=_settled_laya(laya_task),
             )
 
         # Do not make a remote embedding call when there is no vector index to
@@ -588,9 +607,27 @@ class JevRouter:
             if item["chunk_id"] not in {fts["chunk_id"] for fts in fts_results}
         ]
 
+        # Nothing local answered the query, so the classifier's verdict is worth
+        # having - and this is the first point where anything needs it.  Resolving
+        # it here rather than before the embedding call means the GPU2 round trip
+        # overlaps that network call instead of serialising in front of it.
+        laya = await laya_task
+        laya_data = laya.to_dict()
+        laya_accepted = laya.trusted
+        laya_strategy = laya.strategy if laya_accepted else "general_fallback"
+        # ML may recommend retrieval, but it never gains authority to execute
+        # commands. Direct execution remains exclusively rule-gated above.
+        if laya.strategy == "direct_cmd":
+            laya_data["execution_override"] = "direct_cmd_requires_regex_match"
+            laya_strategy = "general_fallback"
+        target_agent = AgentType.DB if laya_accepted and laya_strategy == "database_search" else AgentType.GENERAL
+
         # Check vector similarity threshold
         best_score = vector_results[0]["score"] if vector_results else 0.0
-        if best_score >= SIMILARITY_THRESHOLD and laya_strategy != "graph_lightrag":
+        # The classifier no longer vetoes this exit.  Its strategy label comes
+        # from the invented taxonomy, and a label that is wrong two times in
+        # three must not be able to suppress a good vector hit.
+        if best_score >= SIMILARITY_THRESHOLD:
             context = "\n\n".join(r["content"] for r in vector_results[:5])
             return RoutingResult(
                 routing_decision=RoutingDecision(

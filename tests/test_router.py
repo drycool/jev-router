@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from api import server
 from core.decision_engine import DecisionEngineClient, DecisionEngineResult
-from core.laya_client import LayaTier1Client
+from core.laya_client import LayaDecision, LayaTier1Client, not_awaited
 from core.shadow import ShadowProbe
 from core.router import (
     AgentExecutor,
@@ -151,8 +151,12 @@ class RouterTests(unittest.TestCase):
                 router = JevRouter()
                 class Laya:
                     async def predict_routing(self, _):
-                        from core.laya_client import LayaDecision
-                        return LayaDecision(strategy="direct_cmd", domain="general", confidence=0.99, status="success")
+                        # A fully trusted classifier: even then it must not gain
+                        # authority to execute anything.
+                        return LayaDecision(
+                            strategy="direct_cmd", domain="general", confidence=0.99,
+                            task="code", task_confidence=0.99, status="success",
+                        )
                 async def no_embedding(_): return None
                 async def no_graph(*_, **__): return {"response": ""}
                 router.laya = Laya()
@@ -161,6 +165,77 @@ class RouterTests(unittest.TestCase):
                 result = asyncio.run(router.route("please erase all documents"))
                 self.assertEqual(result.target_agent, AgentType.GENERAL)
                 self.assertEqual(result.laya_result["execution_override"], "direct_cmd_requires_regex_match")
+                router.tier2.close()
+
+    def test_local_exact_hit_does_not_wait_for_the_classifier(self):
+        """An exactly answerable query measured 56.0 ms end to end, of which
+        55.3 ms was the GPU2 round trip - and the answer never used the verdict.
+        Nothing in the local path needs the classifier to answer."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                router = JevRouter()
+                router.tier2.index_chunk("one", "Raspberry Pi cable cable cable GPIO pinout")
+                router.tier2.commit()
+
+                class SlowLaya:
+                    async def predict_routing(self, _):
+                        await asyncio.sleep(30)
+                        raise AssertionError("an exact local hit must not await the classifier")
+
+                router.laya = SlowLaya()
+                started = time.perf_counter()
+                result = asyncio.run(router.route("Raspberry Pi cable"))
+                elapsed = time.perf_counter() - started
+                self.assertEqual(result.routing_decision.strategy, Strategy.EXACT_FTS)
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual(result.laya_result["status"], "not_awaited")
+                router.tier2.close()
+
+    def test_classifier_cannot_veto_a_local_exact_hit(self):
+        """The model used to suppress exact local hits whenever it answered
+        graph_lightrag - a label from the taxonomy it was never trained on."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                router = JevRouter()
+                router.tier2.index_chunk("one", "Raspberry Pi cable cable cable GPIO pinout")
+                router.tier2.commit()
+
+                class Laya:
+                    async def predict_routing(self, _):
+                        return LayaDecision(
+                            strategy="graph_lightrag", domain="raspberry_pi",
+                            confidence=0.9999, task="code", task_confidence=0.99,
+                            status="success",
+                        )
+
+                router.laya = Laya()
+                result = asyncio.run(router.route("Raspberry Pi cable"))
+                self.assertEqual(result.routing_decision.strategy, Strategy.EXACT_FTS)
+                router.tier2.close()
+
+    def test_subject_domain_never_comes_from_the_classifier(self):
+        """The classifier's domain question measured 33.3% against 100% for the
+        rule, so its answer is recorded for analysis and otherwise ignored."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                router = JevRouter()
+
+                class Laya:
+                    async def predict_routing(self, _):
+                        return LayaDecision(
+                            strategy="complex_llm", domain="raspberry_pi",
+                            confidence=0.9995, task="code", task_confidence=0.95,
+                            status="success",
+                        )
+
+                async def no_embedding(_): return None
+                async def no_graph(*_, **__): return {"response": ""}
+                router.laya = Laya()
+                router.get_embedding = no_embedding
+                router.tier3.search = no_graph
+                result = asyncio.run(router.route("refactor the go parser"))
+                self.assertEqual(result.extracted_metadata.domain, "general")
+                self.assertEqual(result.laya_result["domain"], "raspberry_pi")
                 router.tier2.close()
 
     def test_stats_exposes_observability_counters(self):
@@ -173,6 +248,7 @@ class RouterTests(unittest.TestCase):
             "agent_errors",
             "laya_predictions",
             "laya_accepted",
+            "laya_not_awaited",
             "decision_engine_requests",
             "decision_engine_errors",
             "decision_engine_low_confidence",
@@ -432,3 +508,32 @@ class LayaClientTests(unittest.TestCase):
         self.assertEqual(decision.status, "success")
         self.assertEqual(decision.strategy, "complex_llm")
         self.assertAlmostEqual(decision.confidence, 0.93)
+
+    def test_trust_follows_the_preset_signal_not_the_invented_confidence(self):
+        """0.9995 on a hand-written question is not evidence of anything: this
+        checkpoint was never trained on that taxonomy. Raising the threshold
+        cannot filter it, because the wrong answer is the confident one."""
+        invented = LayaDecision(confidence=0.9995, task_confidence=0.0, status="success")
+        self.assertFalse(invented.trusted)
+        preset = LayaDecision(confidence=0.10, task="code", task_confidence=0.95, status="success")
+        self.assertTrue(preset.trusted)
+        self.assertFalse(not_awaited().trusted)
+
+    def test_preset_signals_are_parsed_from_the_response(self):
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "strategy": "complex_llm", "domain": "raspberry_pi", "confidence": 0.31,
+                    "status": "success", "task": "code",
+                    "task_confidence": 0.9255, "difficulty": 3.0,
+                },
+            )
+
+        client = LayaTier1Client(base_url="http://shadow.test", transport=httpx.MockTransport(handler))
+        decision = asyncio.run(client.predict_routing("rewrite the router in Go"))
+        self.assertEqual(decision.task, "code")
+        self.assertAlmostEqual(decision.task_confidence, 0.9255)
+        self.assertAlmostEqual(decision.difficulty, 3.0)
+        self.assertTrue(decision.trusted)
+        self.assertEqual(decision.to_dict()["task"], "code")
