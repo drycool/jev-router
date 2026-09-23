@@ -38,6 +38,7 @@ from core.vector_index import (  # noqa: E402
     load_index,
     memory_rows_from_fts5,
     merge_memory,
+    prune_excluded,
     save_index,
 )
 
@@ -76,8 +77,15 @@ async def build(args: argparse.Namespace) -> int:
         return 2
 
     index = load_index(args.index)
+    total_before = len(index["chunk_ids"])
+    index, prune_stats = prune_excluded(index)
     chunks = memory_rows_from_fts5(args.db)
     print(f"index   : {args.index}")
+    if prune_stats["pruned"]:
+        sources = ", ".join(f"{name} x{count}"
+                            for name, count in prune_stats["sources"].items())
+        print(f"excluded: dropped {prune_stats['pruned']} of {total_before} vectors "
+              f"({sources}) - JEV_VECTOR_EXCLUDE_SOURCES")
     print(f"  model={index['model']} dimension={index['dimension']} "
           f"rows={len(index['chunk_ids'])} (corpus {corpus_rows(index)})")
     print(f"memory  : {len(chunks)} chunks from FTS5")

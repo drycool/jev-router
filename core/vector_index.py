@@ -19,6 +19,7 @@ without a GPU: `merge_memory` never calls the network.
 """
 from __future__ import annotations
 
+import collections
 import os
 import sqlite3
 import tempfile
@@ -33,9 +34,32 @@ import numpy as np
 MEMORY_CHUNK_PREFIX = "mem:"
 ENTITY_MEMORY = "memory"
 
+# Sources that must not reach the vector index at all.
+#
+# The OCR'd Espero manual was 4414 of 4562 vectors and scored 0.75-0.83 against
+# *every* query - autostart, schema validation, "rewrite the router in Go",
+# cylinder-head torque - because its mangled fragments (soft hyphens, broken
+# words) sit near the mean of the embedding space. That put the noise floor above
+# the correct answers (0.55-0.69), so the 0.80 gate fired on garbage while the
+# real content ranked #4536 of 4593. The manual stays in FTS5, where literal term
+# matching is unaffected by this; it is removed from the vector index only.
+#
+# Matched as a substring of the source path, so re-ingesting the manual under
+# another directory does not sneak it back in.
+EXCLUDED_SOURCE_MARKERS: tuple[str, ...] = tuple(
+    marker.strip()
+    for marker in os.getenv("JEV_VECTOR_EXCLUDE_SOURCES", "d_espero.pdf").split(",")
+    if marker.strip()
+)
+
 
 class VectorIndexError(RuntimeError):
     """A merge that would corrupt the index is refused rather than written."""
+
+
+def is_excluded_source(source: str, markers: tuple[str, ...] | None = None) -> bool:
+    markers = EXCLUDED_SOURCE_MARKERS if markers is None else markers
+    return any(marker in source for marker in markers)
 
 
 def load_index(path: str | Path) -> dict:
@@ -111,6 +135,34 @@ def corpus_rows(index: dict) -> int:
     """How many rows are not memory rows."""
     return sum(1 for cid in index["chunk_ids"]
                if not str(cid).startswith(MEMORY_CHUNK_PREFIX))
+
+
+def prune_excluded(index: dict, markers: tuple[str, ...] | None = None) -> tuple[dict, dict]:
+    """Drop rows whose source matches an exclusion marker.
+
+    Pure, like the merge: it slices arrays and never touches the network. Running
+    it twice is a no-op, and it never rebuilds a kept row - the surviving vectors
+    are the ones that were already in the archive, not re-derived ones.
+    """
+    markers = EXCLUDED_SOURCE_MARKERS if markers is None else markers
+    if not markers:
+        return index, {"pruned": 0, "kept": len(index["chunk_ids"]), "sources": {}}
+    keep = np.asarray([not is_excluded_source(str(source), markers)
+                       for source in index["sources"]], dtype=bool)
+    dropped = collections.Counter(
+        str(source).replace("\\", "/").rsplit("/", 1)[-1]
+        for source, keep_it in zip(index["sources"], keep) if not keep_it
+    )
+    if keep.all():
+        return index, {"pruned": 0, "kept": len(index["chunk_ids"]), "sources": {}}
+    pruned = {key: value[keep] if isinstance(value, np.ndarray) else value
+              for key, value in index.items()}
+    stats = {
+        "pruned": int((~keep).sum()),
+        "kept": int(keep.sum()),
+        "sources": dict(dropped.most_common(10)),
+    }
+    return pruned, stats
 
 
 def merge_memory(index: dict, chunks: Sequence[tuple[str, str, str]],

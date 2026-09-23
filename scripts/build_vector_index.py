@@ -11,11 +11,18 @@ became unfindable in the vector tier - the same defect class the FTS5 rebuild
 had.  Use scripts/build_memory_vectors.py for the cheap incremental update of
 just the memory rows.
 
+Chunks whose source matches `JEV_VECTOR_EXCLUDE_SOURCES` (default: the OCR'd
+Espero manual) are filtered out before embedding and again before writing, so the
+vector index holds only the golden corpus: the memory directory and the
+structured Gemini chats.  The manual stays in FTS5, where literal matching is
+unaffected.
+
     python3 scripts/build_vector_index.py --chunks /path/to/chunks.json
     python3 scripts/build_vector_index.py --chunks ... --no-memory
 """
 import argparse
 import asyncio
+import collections
 import json
 import os
 import sys
@@ -29,8 +36,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.router import detect_domain
 from core.vector_index import (
     embed_texts,
+    is_excluded_source,
     memory_rows_from_fts5,
     merge_memory,
+    prune_excluded,
     save_index,
 )
 
@@ -49,6 +58,21 @@ async def build(args: argparse.Namespace) -> None:
         for chunk_id, item in source_data.items()
         if item.get("content", "")
     ]
+    # Filter before embedding, not after: the excluded manual is the bulk of the
+    # store, so embedding it first would spend the GPU time the policy exists to
+    # avoid.
+    kept = [row for row in records if not is_excluded_source(row[2])]
+    if len(kept) != len(records):
+        excluded = collections.Counter(
+            row[2].replace("\\", "/").rsplit("/", 1)[-1]
+            for row in records if is_excluded_source(row[2])
+        )
+        print(f"excluded {len(records) - len(kept)} of {len(records)} chunks from the store "
+              f"({', '.join(f'{name} x{count}' for name, count in excluded.most_common(5))}) "
+              f"- JEV_VECTOR_EXCLUDE_SOURCES, not embedded")
+    records = kept
+    if not records:
+        raise RuntimeError("every chunk in the store is excluded; nothing to build")
     timeout = httpx.Timeout(connect=args.connect_timeout, read=args.read_timeout,
                             write=args.read_timeout, pool=args.connect_timeout)
     batches: list[np.ndarray] = []
@@ -80,6 +104,11 @@ async def build(args: argparse.Namespace) -> None:
             "model": args.model,
             "dimension": int(embeddings.shape[1]),
         }
+        # Belt and braces: the records were filtered above, but a source could
+        # have been added to the policy since the store was written.
+        index, prune_stats = prune_excluded(index)
+        if prune_stats["pruned"]:
+            print(f"excluded: dropped {prune_stats['pruned']} more vectors by source policy")
         save_index(args.output, index)
         print(f"wrote {len(records)} corpus vectors, dimension={embeddings.shape[1]}, "
               f"model={args.model}: {args.output}")

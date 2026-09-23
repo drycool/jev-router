@@ -19,10 +19,13 @@ import numpy as np
 from core.router import EMBEDDING_MODEL, Tier2Search
 from core.vector_index import (
     ENTITY_MEMORY,
+    EXCLUDED_SOURCE_MARKERS,
     VectorIndexError,
     corpus_rows,
+    is_excluded_source,
     load_index,
     merge_memory,
+    prune_excluded,
     save_index,
 )
 
@@ -116,6 +119,58 @@ class MergeTests(unittest.TestCase):
         merged, _ = merge_memory(_corpus_index(rows=5), _memory_chunks(2),
                                  np.zeros((2, 4), dtype=np.float32))
         self.assertEqual(corpus_rows(merged), 5)
+
+
+class ExclusionTests(unittest.TestCase):
+    """The golden-corpus policy: the OCR'd manual must not reach the vector index."""
+
+    def _mixed_index(self) -> dict:
+        index = _corpus_index(rows=3)
+        index["sources"] = np.asarray([
+            "C:\\Users\\369\\Downloads\\d_espero\\d_espero.pdf",
+            "Gemini-Кабель для Raspberry Pi 5_chunk_5.md",
+            "d_espero.pdf",
+        ])
+        return index
+
+    def test_excluded_sources_are_dropped_and_the_rest_survive_untouched(self):
+        index = self._mixed_index()
+        pruned, stats = prune_excluded(index, markers=("d_espero.pdf",))
+
+        self.assertEqual(stats["pruned"], 2)
+        self.assertEqual(stats["kept"], 1)
+        self.assertEqual(list(pruned["chunk_ids"]), ["chunk-1"])
+        np.testing.assert_array_equal(pruned["embeddings"], index["embeddings"][1:2])
+        self.assertEqual(list(pruned["sources"]),
+                         ["Gemini-Кабель для Raspberry Pi 5_chunk_5.md"])
+        self.assertEqual(pruned["model"], index["model"])
+
+    def test_the_marker_matches_a_path_not_only_a_filename(self):
+        # Re-ingesting the manual under another directory must not smuggle it back.
+        self.assertTrue(is_excluded_source("/mnt/backup/d_espero.pdf", ("d_espero.pdf",)))
+        self.assertTrue(is_excluded_source("C:\\Users\\369\\Downloads\\d_espero\\d_espero.pdf",
+                                           ("d_espero.pdf",)))
+        self.assertFalse(is_excluded_source("/home/dry/memory/global/linux_systemd.md",
+                                            ("d_espero.pdf",)))
+
+    def test_pruning_is_a_no_op_without_markers_and_when_nothing_matches(self):
+        index = self._mixed_index()
+        same, stats = prune_excluded(index, markers=())
+        self.assertEqual(stats["pruned"], 0)
+        self.assertIs(same, index)
+        kept, stats = prune_excluded(index, markers=("nothing-matches-this",))
+        self.assertEqual(stats["pruned"], 0)
+        self.assertIs(kept, index)
+
+    def test_the_default_policy_names_the_ocr_manual(self):
+        self.assertIn("d_espero.pdf", EXCLUDED_SOURCE_MARKERS)
+
+    def test_memory_rows_are_not_excluded_by_the_corpus_policy(self):
+        index = _corpus_index(rows=1)
+        merged, _ = merge_memory(index, _memory_chunks(1), np.zeros((1, 4), dtype=np.float32))
+        pruned, stats = prune_excluded(merged, markers=("d_espero.pdf",))
+        self.assertEqual(stats["pruned"], 1, "only the corpus row matches")
+        self.assertEqual(list(pruned["entity_types"]), [ENTITY_MEMORY])
 
 
 class ArchiveTests(unittest.TestCase):

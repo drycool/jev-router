@@ -355,53 +355,47 @@ Measured through the live service with `execute=false` (retrieval only, no LLM):
 43 ms for the systemd, Go-MCP and Jev-limits questions, with the expected file at rank 1 in all
 three. The full path with the agent costs ~12.7 s, of which retrieval is 24 ms.
 
-Memory documents are also in the vector index (4562 corpus vectors → 4593):
+The vector index holds the **golden corpus only**: the memory documents plus the structured Gemini
+chats. `JEV_VECTOR_EXCLUDE_SOURCES` (default `d_espero.pdf`) keeps the OCR'd Espero manual out of it, and
+both builders apply that policy — `build_vector_index.py` filters before embedding (so the GPU time is not
+spent on it) and `build_memory_vectors.py` prunes whatever an older archive still holds.
 
 ```bash
 python3 scripts/build_memory_vectors.py --dry-run   # what would change, no GPU, no write
-python3 scripts/build_memory_vectors.py             # embed the memory rows (~1 s for 31)
+python3 scripts/build_memory_vectors.py             # prune the policy + refresh the memory rows
 python3 scripts/fingerprint_vectors.py              # corpus fingerprint, before/after
 ```
 
-The corpus rows come through byte-identical, and that is proven by fingerprinting the corpus
-slice before and after (same sha256 for embeddings, chunk ids, contents, sources and domains),
-not by reading the merge code — a merge that quietly dropped them would look like a healthy
-index. Running it twice replaces the memory rows instead of adding a second copy (`memory rows
-replaced: 31`, total still 4593). `build_vector_index.py` calls the same merge, so a full corpus
-rebuild cannot silently drop memory.
+| | vectors | file |
+|---|---|---|
+| before | 4593 (4414 OCR manual + 148 Gemini + 31 memory) | 19.5 MB |
+| after | **209** (148 Gemini + 61 memory) | **0.9 MB** |
 
-**What the vector tier cannot do on this data — measured, and it is not a threshold problem.**
-With the memory rows in place, `search_vector` still does not reach them:
+The surviving rows are the same vectors, not re-derived ones: the Gemini-corpus fingerprints (sha256 over
+embeddings, chunk ids, contents, sources) are identical before and after the cut. A second merge run
+replaces the memory rows instead of adding a copy, and `build_vector_index.py` calls the same code, so a
+full corpus rebuild cannot quietly drop memory.
 
-| query | best cosine in the expected file | its rank | what the router actually returned |
-|---|---|---|---|
-| Настройка автозапуска фоновых служб пользователя | 0.5554 | **#4560 of 4593** | `vector_fast`, 5 Espero OCR fragments, 0.8014–0.8148 |
-| Правила валидации схем в асинхронных эндпоинтах | 0.5861 | **#4536 of 4593** | `vector_fast`, 15 Espero OCR fragments, 0.8170–0.8301 |
+What the cleanup did and did not fix:
 
-Unrelated OCR fragments score *higher* than the correct content, so the 0.80 gate fires on
-garbage: four unrelated queries (autostart, schema validation, "rewrite the router in Go",
-cylinder-head torque) all land in 0.75–0.83 against that corpus. No threshold setting separates
-them — the correct answers score *below* the noise, so lowering the gate admits the noise first
-and raising it empties the tier. The model documents its own limitation:
-`mixedbread-ai/mxbai-embed-large-v1` declares `language: [en]`, while the corpus and every query
-here are Russian. Measured separately: adding the documented retrieval prompt
-(`Represent this sentence for searching relevant passages: `) does not help — it lowers every
-score (0.5554 → 0.5106) without changing the order. Excluding short chunks does not help either
-(corpus median 395 characters, so there is nothing to exclude).
+- **Latency: fixed.** Cold archive load 330 ms → **14.7 ms**; the cosine pass over the archive 0.9–2.6 ms;
+  warm cache reads 0.15 ms. The 330 ms was never the search — it was decompressing 4562×1024 floats.
+- **Espero false positives: fixed.** The 0.80–0.83 garbage is gone because its source is gone; every top-3
+  hit is now a golden-corpus row.
+- **Semantic ranking: not fixed, and not fixable by the corpus.** For the paraphrased queries the expected
+  file still ranks near the bottom (best cosine 0.5554 / 0.5861 / 0.5882 — places #154 / #151 / #157 of 209),
+  below the 0.80 gate, so the vector tier returns nothing for them. Measured separability: the smallest
+  cosine against a *correct* target (0.5554) sits far below the largest cosine of an *unrelated* query
+  (0.8669, the Raspberry Pi cable chat). No threshold separates those two sets, so the threshold discussion
+  was the wrong discussion — the geometry is the problem. `mixedbread-ai/mxbai-embed-large-v1` declares
+  `language: [en]` while the corpus and every query here are Russian.
 
-It is not uniformly broken: for `"Какие кабели обсуждались для Raspberry Pi 5?"` the top five are
-the Gemini cable chunks at 0.8266–0.8669, i.e. the right content. The failure is specific to the
-OCR'd Espero manual, whose fragments (soft hyphens, broken words) sit near the mean of the space
-and score 0.75–0.83 whatever is asked.
-
-The memory rows themselves add no false positives: their maximum on the unrelated queries is
-0.62–0.73, below the gate. Nor is the gate's behaviour on those two queries new — measured before
-the merge, the same queries already scored 0.8148 and 0.8301 against the corpus.
-
-What actually serves memory today is FTS5 with real words (18–86 ms, expected file at rank 1).
-Leaving the vector tier as it is, fixing it means either a multilingual embedder (a corpus
-re-embedding decision) or a criterion other than an absolute cosine. Both are operator calls;
-neither is a threshold tweak.
+Two more findings from the same run. With the paraphrases the router now answers from FTS5
+(`exact_fts`, 28–40 ms) instead of the vector tier — and the top chunk is often OCR text from the manual,
+because the manual is still in FTS5 by design: the vector noise is gone, the FTS ranking problem is
+untouched. And the two original test questions ("…автозапуска фоновых служб…", "…валидации схем…") are now
+answered in 6.7 / 25.7 ms from `jev_gateway.md`, because that file quotes them verbatim as measured
+evidence — worth knowing before reading it as a semantic win.
 
 ## What the agent actually reads
 
