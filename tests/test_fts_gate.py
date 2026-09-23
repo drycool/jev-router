@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.router import JevRouter, Strategy, _gate_selection, _is_fts_exact
+from scripts.check_memory_contamination import competitors
 
 RAW_SOURCE = "C:/Users/369/Downloads/d_espero/d_espero.pdf"
 QUERY = "затяжка болтов головки блока цилиндров момент"
@@ -149,6 +150,42 @@ class GateRoutingTests(unittest.TestCase):
             # still gets the manual's own text.
             self.assertNotEqual(result.routing_decision.strategy, Strategy.EXACT_FTS)
             self.assertIn("болтов головки цилиндров", result.context)
+
+
+
+class MemoryContaminationTests(unittest.TestCase):
+    """The check that keeps the indexed memory from competing with its controls.
+
+    Three times in one session a finding was written into the corpus with the
+    control query's own words, and the document describing the measurement then
+    won the gate for that query.  This is the guard, tested on the shape that
+    actually happened.
+    """
+
+    def test_prose_that_repeats_the_query_is_reported(self):
+        rows = [("mem:projects/jev_gateway.md#10",
+                 "запрос про кабели (Raspberry Pi) ушёл в vector_fast",
+                 "/home/dry/memory/projects/jev_gateway.md")]
+        found = competitors(rows, "Кабели для Raspberry Pi 5", "Gemini")
+        self.assertEqual([chunk_id for chunk_id, _ in found],
+                         ["mem:projects/jev_gateway.md#10"])
+
+    def test_the_file_that_should_answer_is_not_a_competitor(self):
+        rows = [("mem:projects/garageos.md#2",
+                 "garageOS чёрный ящик инцидентов",
+                 "/home/dry/memory/projects/garageos.md")]
+        self.assertEqual(competitors(
+            rows, "Как устроена двухслойная конфигурация garageOS и чёрный ящик инцидентов",
+            "garageos.md"), [])
+
+    def test_the_raw_corpus_is_never_reported(self):
+        rows = [("raw", "болтов головки блока цилиндров момент", RAW_SOURCE)]
+        self.assertEqual(competitors(rows, QUERY, "d_espero.pdf"), [])
+
+    def test_a_clean_description_is_clean(self):
+        rows = [("mem:projects/x.md#1", "запрос про периферию Pi5",
+                 "/home/dry/memory/projects/x.md")]
+        self.assertEqual(competitors(rows, "Кабели для Raspberry Pi 5", "Gemini"), [])
 
 
 if __name__ == "__main__":
