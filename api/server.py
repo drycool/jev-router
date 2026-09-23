@@ -44,6 +44,7 @@ from core.router import (
     RoutingResult,
     Strategy,
 )
+from core.memory_index import MEMORY_DIR, index_memory
 from core.shadow import ShadowProbe, ShadowTarget
 from agents.base import (
     GeneralAgent, CodeAgent, DBAgent, TroubleshooterAgent,
@@ -242,6 +243,9 @@ async def lifespan(app: FastAPI):
 
     # Index existing LightRAG chunks into FTS5
     await _index_lightrag_chunks()
+    # Then the working-memory documents.  Order matters: the rebuild above starts
+    # with clear(), so anything indexed before it would be deleted immediately.
+    await _index_memory_docs()
 
     yield
     await shadow_probe.aclose()
@@ -280,6 +284,32 @@ async def _index_lightrag_chunks():
         print(f"[Jev] Indexed {count} chunks into FTS5")
     except Exception as e:
         print(f"[Jev] FTS5 indexing error: {e}")
+
+
+async def _index_memory_docs():
+    """Index the working-memory directory into FTS5 as part of the same rebuild.
+
+    Additive: it writes rows the router's own search already knows how to read
+    (`entity_type='memory'`), and changes no routing, gating or ranking
+    behaviour.  The FTS5 table is a *derived* index - thrown away and rebuilt on
+    every start - so without this step the memory documents indexed by
+    `scripts/index_memory.py` survive only until the next restart.  Measured
+    before this was added: restart took the index from 4593 rows to 4562, with
+    zero memory rows left.
+
+    A missing directory is not an error: the router has to start on a machine
+    where `/home/dry/memory` has not been created yet.
+    """
+    try:
+        stats = index_memory(router.tier2.conn)
+        if not stats["exists"]:
+            print(f"[Jev] memory directory not found: {stats['root']} (skipped)")
+            return
+        print(f"[Jev] Indexed {stats['inserted']} memory chunks from "
+              f"{stats['files']} files in {stats['root']} "
+              f"(replaced {stats['removed']}, {stats['chars']} chars)")
+    except Exception as e:
+        print(f"[Jev] memory indexing error: {e}")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────

@@ -316,6 +316,50 @@ disk (mtime + size), so rebuilding it does not require a restart. Loading it per
 and because the load is synchronous, it also delayed timer callbacks, which is why the
 classifier's 150 ms budget was observed firing at ~420 ms.
 
+## Working memory
+
+`JEV_MEMORY_DIR` (default `/home/dry/memory`) holds the readable, diffable copy of what the
+project knows: `global/` for environment rules, `projects/` for per-project architecture,
+`decisions/` for ADRs. It is indexed into the *same* FTS5 table as the corpus, so one BM25 index
+answers both, and the documents are tagged `entity_type='memory'` with their absolute path in
+`source` — identifiable and removable without touching the corpus.
+
+The server re-indexes that directory on every start, right after the LightRAG rebuild:
+
+```
+[Jev] Indexed 4562 chunks into FTS5
+[Jev] Indexed 31 memory chunks from 5 files in /home/dry/memory (replaced 0, 21463 chars)
+```
+
+Order matters: the LightRAG step begins with `clear()`, so memory indexed before it would be
+deleted on every start. `tests/test_memory_index.py::ServerWiringTests` asserts the order rather
+than trusting it.
+
+Why this exists at all: the FTS5 table is a *derived* index, rebuilt from
+`JEV_LIGHTRAG_CHUNKS_PATH` on every start. Indexing the directory only by hand meant a restart
+took the index from 4593 rows to 4562 with zero memory rows — measured, not assumed:
+
+```bash
+sqlite3 storage/jev_fts5.db "DELETE FROM chunks WHERE entity_type='memory';"   # 4593 -> 4562
+systemctl --user restart jev.service
+sqlite3 storage/jev_fts5.db "SELECT entity_type, COUNT(*) FROM chunks GROUP BY entity_type;"  # memory|31
+```
+
+Chunking is by Markdown level-2 heading, each chunk prefixed `"<document title> :: <section>"`,
+capped at 1800 characters (under the 2000 the corpus uses, so one document type is not penalised
+by BM25's length normalisation alone). `scripts/index_memory.py` is the same code from the
+command line — with a dry run and per-file counts — for editing a document on a machine where
+the service is not running. Two chunkers would drift; there is one, in `core/memory_index.py`.
+
+Measured through the live service with `execute=false` (retrieval only, no LLM): 19 ms / 24 ms /
+43 ms for the systemd, Go-MCP and Jev-limits questions, with the expected file at rank 1 in all
+three. The full path with the agent costs ~12.7 s, of which retrieval is 24 ms.
+
+Known limits: the vector index does not cover the memory directory (0 of 4562 entries in
+`storage/jev_vectors.npz`) so `search_vector` cannot find it, and memory shares one BM25 index
+with the OCR'd manual, which occasionally outranks a memory chunk with short garbage fragments
+matching on stop words.
+
 ## What the agent actually reads
 
 Three separate limits decided this, and two of them were invisible. The same class of defect —
@@ -615,6 +659,18 @@ calibrated — it simply never fires, which is a different problem from a thresh
 ```bash
 python3 -m unittest discover -v
 python3 -m py_compile core/router.py core/decision_engine.py core/shadow.py core/laya_client.py api/server.py scripts/benchmark_laya.py scripts/measure_route_latency.py scripts/analyze_laya_verdicts.py tests/test_router.py
+```
+
+Run it exactly like that, from the project root. Adding `-s tests` looks equivalent and is not:
+discovery then imports the modules as top-level (`test_router` rather than `tests.test_router`),
+so `tests/__init__.py` never runs — and that file is where the log paths are redirected away from
+production. The run then appends the `"Raspberry Pi cable"` fixture from `test_router.py` to
+`jev_decisions.jsonl` (one ~912-byte record per run) and `TestProductionLogsAreProtected` fails.
+That guard is doing its job: it is how the wrong invocation was caught, not a symptom of a bug in
+the router. Records already written are removable by hash:
+
+```bash
+python3 scripts/quarantine_queries.py --query "Raspberry Pi cable" --apply
 ```
 
 ## Publication Notes
