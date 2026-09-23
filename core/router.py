@@ -104,6 +104,14 @@ FTS_GATE_RAW_EXIT_TERMS = int(os.getenv("JEV_FTS_GATE_RAW_EXIT_TERMS", "4"))
 # so this is ~60x headroom. On expiry the vector layer is skipped and the local FTS
 # results are served, exactly as when the embedder is unreachable.
 EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "2.0"))
+# How long the embedder is kept loaded on GPU2.  The embedder and the answer
+# model share one 12 GB card and ollama unloads an un-kept model, so without
+# this the embedding call reloads bge-m3 (4163 ms measured) and busts the budget
+# above every time the answer model is resident - the vector tier then drops
+# out of every request without saying so.  Bounded rather than infinite on
+# purpose: a permanently pinned embedder would take the VRAM the 10 GB model
+# needs when GPU2 is switched to that workload.
+EMBEDDING_KEEP_ALIVE = os.getenv("JEV_EMBEDDING_KEEP_ALIVE", "30m")
 
 # How deep retrieval goes before context assembly sees anything.  This is a separate
 # decision from the budget below, and it is the one that decides whether a needed chunk is
@@ -868,6 +876,13 @@ class JevRouter:
         None is a supported outcome, not an error: the caller skips the vector layer and
         serves the local FTS results.
 
+        `keep_alive` is sent on every request because the embedder and the answer model
+        share one 12 GB card, and ollama unloads a model that is not kept.  Measured
+        before this: with the 9B answer model resident, every embedding call reloaded
+        bge-m3 (4163 ms cold) and blew the 2.0 s budget, so the vector tier silently
+        dropped out of *every* request while the service kept answering from the degraded
+        path - 15 of 15 control queries fell back in one run.  With the embedder kept the
+        warm call is 59 ms and both models stay loaded (5.7 + 1.3 GB).
         """
         try:
             import httpx
@@ -875,15 +890,20 @@ class JevRouter:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(EMBEDDING_TIMEOUT_S)) as client:
                     resp = await client.post(
                         EMBEDDING_API,
-                        json={"model": EMBEDDING_MODEL, "input": text},
+                        json={"model": EMBEDDING_MODEL, "input": text,
+                              "keep_alive": EMBEDDING_KEEP_ALIVE},
                     )
                     resp.raise_for_status()
                     data = resp.json()
             embeddings = data.get("embeddings", [])
             if embeddings:
                 return np.array(embeddings[0])
-        except Exception:
-            pass
+        except Exception as error:
+            # A silent None is how a dead embedder stayed invisible for a whole
+            # session: the request still answers, from the degraded path.  The
+            # caller keeps its behaviour; the operator gets one line.
+            print(f"[Jev] embedding unavailable ({type(error).__name__}: {error}); "
+                  f"vector tier skipped for this request", flush=True)
         return None
 
     async def route(self, query: str) -> RoutingResult:
