@@ -453,6 +453,10 @@ class Tier2Search:
                     "model": str(db["model"].item()),
                     "dimension": int(db["dimension"].item()),
                 }
+                # Optional: it appeared with the memory tier.  An archive built
+                # before that is still searched, just without entity tags.
+                if "entity_types" in db.files:
+                    data["entity_types"] = db["entity_types"]
         except (OSError, KeyError, ValueError):
             return None
         self._vector_cache = (key, data)
@@ -547,6 +551,9 @@ class Tier2Search:
         contents = index["contents"]
         sources = index["sources"]
         domains = index["domains"]
+        # Newer archives carry it; older ones do not, and an absent tag is not a
+        # reason to drop a result.
+        entity_types = index.get("entity_types")
         model = index["model"]
         dimension = index["dimension"]
 
@@ -570,6 +577,8 @@ class Tier2Search:
                 return []
             embeddings = embeddings[mask]
             chunk_ids, contents, sources = chunk_ids[mask], contents[mask], sources[mask]
+            if entity_types is not None:
+                entity_types = entity_types[mask]
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1, norms)
         normalized = embeddings / norms
@@ -587,6 +596,10 @@ class Tier2Search:
                 "chunk_id": str(chunk_ids[idx]),
                 "content": str(contents[idx]),
                 "source": str(sources[idx]),
+                # Which tier the chunk came from. The FTS5 path already carries
+                # this; without it here, a memory hit on the vector path would be
+                # indistinguishable from a corpus hit in the decision log.
+                "entity_type": str(entity_types[idx]) if entity_types is not None else "",
                 "score": score,
                 "search_type": "vector",
                 "elapsed_ms": (time.perf_counter() - t0) * 1000,

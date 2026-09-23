@@ -355,10 +355,53 @@ Measured through the live service with `execute=false` (retrieval only, no LLM):
 43 ms for the systemd, Go-MCP and Jev-limits questions, with the expected file at rank 1 in all
 three. The full path with the agent costs ~12.7 s, of which retrieval is 24 ms.
 
-Known limits: the vector index does not cover the memory directory (0 of 4562 entries in
-`storage/jev_vectors.npz`) so `search_vector` cannot find it, and memory shares one BM25 index
-with the OCR'd manual, which occasionally outranks a memory chunk with short garbage fragments
-matching on stop words.
+Memory documents are also in the vector index (4562 corpus vectors → 4593):
+
+```bash
+python3 scripts/build_memory_vectors.py --dry-run   # what would change, no GPU, no write
+python3 scripts/build_memory_vectors.py             # embed the memory rows (~1 s for 31)
+python3 scripts/fingerprint_vectors.py              # corpus fingerprint, before/after
+```
+
+The corpus rows come through byte-identical, and that is proven by fingerprinting the corpus
+slice before and after (same sha256 for embeddings, chunk ids, contents, sources and domains),
+not by reading the merge code — a merge that quietly dropped them would look like a healthy
+index. Running it twice replaces the memory rows instead of adding a second copy (`memory rows
+replaced: 31`, total still 4593). `build_vector_index.py` calls the same merge, so a full corpus
+rebuild cannot silently drop memory.
+
+**What the vector tier cannot do on this data — measured, and it is not a threshold problem.**
+With the memory rows in place, `search_vector` still does not reach them:
+
+| query | best cosine in the expected file | its rank | what the router actually returned |
+|---|---|---|---|
+| Настройка автозапуска фоновых служб пользователя | 0.5554 | **#4560 of 4593** | `vector_fast`, 5 Espero OCR fragments, 0.8014–0.8148 |
+| Правила валидации схем в асинхронных эндпоинтах | 0.5861 | **#4536 of 4593** | `vector_fast`, 15 Espero OCR fragments, 0.8170–0.8301 |
+
+Unrelated OCR fragments score *higher* than the correct content, so the 0.80 gate fires on
+garbage: four unrelated queries (autostart, schema validation, "rewrite the router in Go",
+cylinder-head torque) all land in 0.75–0.83 against that corpus. No threshold setting separates
+them — the correct answers score *below* the noise, so lowering the gate admits the noise first
+and raising it empties the tier. The model documents its own limitation:
+`mixedbread-ai/mxbai-embed-large-v1` declares `language: [en]`, while the corpus and every query
+here are Russian. Measured separately: adding the documented retrieval prompt
+(`Represent this sentence for searching relevant passages: `) does not help — it lowers every
+score (0.5554 → 0.5106) without changing the order. Excluding short chunks does not help either
+(corpus median 395 characters, so there is nothing to exclude).
+
+It is not uniformly broken: for `"Какие кабели обсуждались для Raspberry Pi 5?"` the top five are
+the Gemini cable chunks at 0.8266–0.8669, i.e. the right content. The failure is specific to the
+OCR'd Espero manual, whose fragments (soft hyphens, broken words) sit near the mean of the space
+and score 0.75–0.83 whatever is asked.
+
+The memory rows themselves add no false positives: their maximum on the unrelated queries is
+0.62–0.73, below the gate. Nor is the gate's behaviour on those two queries new — measured before
+the merge, the same queries already scored 0.8148 and 0.8301 against the corpus.
+
+What actually serves memory today is FTS5 with real words (18–86 ms, expected file at rank 1).
+Leaving the vector tier as it is, fixing it means either a multilingual embedder (a corpus
+re-embedding decision) or a criterion other than an absolute cosine. Both are operator calls;
+neither is a threshold tweak.
 
 ## What the agent actually reads
 
