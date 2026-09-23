@@ -17,6 +17,9 @@ from typing import Optional, Any
 
 import numpy as np
 from core.laya_client import LayaDecision, LayaTier1Client, not_awaited
+# The raw-corpus policy lives in one place and is consumed here rather than
+# re-derived: two definitions of "which sources are raw" would drift.
+from core.vector_index import is_excluded_source
 
 
 # ── Configuration ──────────────────────────────────────────────────────
@@ -57,6 +60,42 @@ EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "bge-m3")
 # measured identical output at every factor).  Set JEV_FTS_MEMORY_BOOST=1 to
 # disable the reordering entirely.
 FTS_MEMORY_BOOST = float(os.getenv("JEV_FTS_MEMORY_BOOST", "1.5"))
+# Whether the exact-FTS early exit may be taken by the raw corpus alone.
+#
+# On, the gate prefers golden/memory rows when both survived it, and a
+# pool of *only* raw-corpus rows does not exit early at all: the request
+# goes on to the vector tier, which searches the golden corpus.  The raw
+# rows are not removed from the pool, so the questions the manual itself
+# answers keep their content - measured on "затяжка болтов головки блока
+# цилиндров момент", whose complete sequence exists only in the manual.
+# Off restores the previous behaviour, where any matching fragment could
+# take the exit.
+FTS_GATE_REQUIRE_GOLDEN = os.getenv(
+    "JEV_FTS_GATE_REQUIRE_GOLDEN", "1").strip().lower() not in {"0", "false", "no", "off"}
+# How many query terms a candidate must contain to take the early exit.
+#
+# It was `min(2, len(keywords))`, and two terms out of six is not a match,
+# it is a coincidence of ordinary words: measured on the current corpus,
+# "проверка типов на асинхронных маршрутах" cleared the gate on a manual
+# fragment containing only проверка + типов (bm25 -6.6), and questions about
+# user services cleared it on при + загрузке.  Three terms, or every term
+# when the query has fewer, is what the measured data separates: the chunks
+# that are genuinely the answer match five and six of six ("затяжка болтов
+# головки блока цилиндров момент" -> 5), while stop-word coincidences reach
+# two.  A query that only clears two now goes on to the vector tier, which
+# searches the golden corpus, instead of exiting on a coincidence.
+FTS_GATE_MIN_TERMS = int(os.getenv("JEV_FTS_GATE_MIN_TERMS", "3"))
+# Content terms a raw-corpus chunk must contain to keep the exit for itself.
+#
+# The manual is the only source for some questions and is excluded from the
+# vector index, so if it may never take the early exit, those questions pay a
+# GPU round trip and lead with unrelated golden-corpus chunks.  The measured
+# boundary: a chunk that is genuinely the document a query came from contains
+# four or more of its content words (the cylinder-head sequence matches five of
+# six), while ordinary-word coincidences reach two.  Above the line the manual
+# answers its own question locally; below it, the raw rows are held back and
+# the vector tier leads.
+FTS_GATE_RAW_EXIT_TERMS = int(os.getenv("JEV_FTS_GATE_RAW_EXIT_TERMS", "4"))
 # Total budget for the embedding call, enforced with asyncio.timeout (same reason as the
 # classifier: an httpx timeout is per socket read, not a deadline). The embedder lives on
 # the node that powers itself off when idle, and this is the fall-through path's only
@@ -341,14 +380,103 @@ def detect_domain(text: str) -> str:
     return "general"
 
 
+# Terms that cannot carry a match on their own.  Counting them is how two
+# ordinary words out of six passed for evidence: the measured exits were on
+# "при" + "загрузке" (a question about user services) and "проверка" + "типов"
+# (a question about schema validation, matched by an OCR fragment).  Function
+# words are common to every chunk of a 4626-row corpus, so matching them says
+# nothing about relevance; only content words are counted.
+FTS_GATE_STOPWORDS = {
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то",
+    "все", "она", "так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за",
+    "бы", "по", "только", "ее", "мне", "было", "вот", "от", "меня", "еще",
+    "нет", "о", "из", "ему", "теперь", "когда", "даже", "ну", "ли", "если",
+    "уже", "или", "ни", "быть", "был", "него", "до", "вас", "вам", "ведь",
+    "там", "потом", "себя", "ей", "может", "они", "тут", "где", "есть",
+    "надо", "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб",
+    "без", "будто", "чего", "раз", "тоже", "себе", "под", "будет", "тогда",
+    "кто", "этот", "того", "потому", "этого", "какой", "совсем", "ним",
+    "здесь", "этом", "один", "почти", "мой", "тем", "чтобы", "нее", "сейчас",
+    "были", "куда", "зачем", "всех", "никогда", "можно", "при", "наконец",
+    "два", "об", "другой", "хоть", "после", "над", "больше", "тот", "через",
+    "эти", "нас", "про", "всего", "них", "какая", "много", "разве", "три",
+    "эту", "моя", "впрочем", "хорошо", "свою", "этой", "перед", "иногда",
+    "лучше", "чуть", "том", "нельзя", "такой", "им", "более", "всегда",
+    "конечно", "всю", "между",
+    "the", "a", "an", "of", "to", "in", "for", "on", "and", "or", "is",
+    "are", "with", "how", "what", "why", "does", "do", "my", "our",
+}
+
+
 def _is_fts_exact(query: str, result: dict) -> bool:
-    """Require multiple meaningful query terms in a candidate before early exit."""
+    """Require enough *content* terms in a candidate before an early exit.
+
+    The threshold is `min(FTS_GATE_MIN_TERMS, len(content terms))`, so a short
+    query is unchanged and a long one needs three real words rather than three
+    words of any kind.
+    """
     keywords = _extract_keywords(query)
     if not keywords:
         return False
+    content_keywords = [k for k in keywords if k.lower() not in FTS_GATE_STOPWORDS]
+    if not content_keywords:
+        # A query of nothing but function words is not a retrieval request; the
+        # old behaviour of counting them is the only thing that could be done.
+        content_keywords = keywords
+    return _content_matches(query, result) >= min(FTS_GATE_MIN_TERMS, len(content_keywords))
+
+
+def _content_matches(query: str, result: dict) -> int:
+    """How many of the query's *content* terms the chunk contains.
+
+    Returned as a count so both the exit rule and the raw-corpus rule
+    measure the same thing; the denominator they apply differs.
+    """
+    keywords = _extract_keywords(query)
+    content_keywords = [k for k in keywords if k.lower() not in FTS_GATE_STOPWORDS]
     content_terms = set(re.findall(r"\b[\wа-яА-ЯёЁ]+\b", result["content"].lower()))
-    matches = sum(keyword.lower() in content_terms for keyword in keywords)
-    return matches >= min(2, len(keywords))
+    return sum(keyword.lower() in content_terms for keyword in content_keywords)
+
+
+def _gate_selection(query: str, results: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split the gate survivors into (may take the early exit, raw rows held back).
+
+    The gate asks whether a candidate contains enough query terms, and the OCR'd
+    manual answers that question well: its 4414 mangled fragments match ordinary
+    Russian words, so a question about schema validation exited on a chunk about
+    wheel alignment while the answer sat in `fastapi_pydantic.md`.  The manual
+    stays in FTS5 (a torque question is answered *only* by it), so the raw corpus
+    is not removed - it is stopped from taking the early exit on its own:
+
+      * memory/golden rows also survived  -> they take it, raw rows are held back
+        from the captured pool (memory wins the ordering argument);
+      * **only** raw rows survived        -> nothing takes the early exit here;
+        the request continues to the vector tier, which searches the golden
+        corpus. If that finds nothing, the ordinary fall-through serves the same
+        FTS pool, so the manual's own questions keep their answers.
+
+    The held-back rows are returned rather than dropped, because the manual has
+    no vectors (it is excluded from that index): a caller that answers from the
+    vector tier must still carry them, or the only copy of a manual answer would
+    disappear from the request.
+
+    Sources are matched through `core.vector_index.is_excluded_source`, so the
+    policy has exactly one definition (`JEV_VECTOR_EXCLUDE_SOURCES`).  A chunk
+    indexed without a source is not the raw corpus.
+    """
+    survivors = [r for r in results if _is_fts_exact(query, r)]
+    if not survivors or not FTS_GATE_REQUIRE_GOLDEN:
+        return survivors, []
+    golden = [r for r in survivors if not is_excluded_source(str(r.get("source") or ""))]
+    raw = [r for r in survivors if is_excluded_source(str(r.get("source") or ""))]
+    if golden or not raw:
+        return golden, raw
+    # Nothing but the raw corpus survived.  It keeps the exit only when its
+    # best chunk is decisive - otherwise the held-back rows wait for the
+    # vector tier, which searches the golden corpus.
+    if _content_matches(query, raw[0]) >= FTS_GATE_RAW_EXIT_TERMS:
+        return raw, []
+    return [], raw
 
 
 def assemble_context(results: list[dict], budget: Optional[int] = None) -> tuple[str, dict]:
@@ -739,6 +867,7 @@ class JevRouter:
 
         None is a supported outcome, not an error: the caller skips the vector layer and
         serves the local FTS results.
+
         """
         try:
             import httpx
@@ -788,7 +917,11 @@ class JevRouter:
         # the embedding server first made an exact local hit wait for the
         # network on every request, defeating the early-exit design.
         fts_results = self.tier2.search_fts5(query)
-        fts_exact = [r for r in fts_results if _is_fts_exact(query, r)]
+        # Who may take this exit is decided by _gate_selection: memory rows when
+        # they also matched, and nobody at all when the only match is the raw
+        # OCR corpus - that case continues to the vector tier below, which
+        # carries the held-back raw rows into its context.
+        fts_exact, raw_held_back = _gate_selection(query, fts_results)
         if fts_exact:
             # Nothing in this answer needs the classifier, so nothing here waits
             # for it: the verdict rides along only if it already arrived.
@@ -849,7 +982,18 @@ class JevRouter:
         # from the invented taxonomy, and a label that is wrong two times in
         # three must not be able to suppress a good vector hit.
         if best_score >= SIMILARITY_THRESHOLD:
-            context, context_stats = assemble_context(vector_results)
+            # When the gate held raw rows back, they ride along after the
+            # vector hits instead of being dropped: the manual is excluded
+            # from the vector index on purpose, so dropping them here would
+            # delete the only copy of its answers from the request.  They
+            # keep their relative order and lose only their claim to the
+            # front of the context.
+            context_results = vector_results
+            if raw_held_back:
+                seen = {item["chunk_id"] for item in vector_results}
+                context_results = vector_results + [
+                    item for item in raw_held_back if item["chunk_id"] not in seen]
+            context, context_stats = assemble_context(context_results)
             return RoutingResult(
                 routing_decision=RoutingDecision(
                     strategy=Strategy.VECTOR_FAST,
