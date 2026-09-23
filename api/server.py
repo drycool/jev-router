@@ -36,6 +36,7 @@ from core.decision_engine import (
 from core.laya_client import LAYA_CONFIDENCE_THRESHOLD, LAYA_URL
 from core.router import (
     EMBEDDING_TIMEOUT_S,
+    MAX_CONTEXT_CHARS,
     AgentType,
     JevRouter,
     LIGHTRAG_ENABLED,
@@ -304,6 +305,9 @@ class QueryResponse(BaseModel):
     rag_configuration: dict
     target_agent: str
     context_preview: str = ""
+    # What retrieval actually handed the agent: chunks considered/used/dropped as
+    # duplicates and the character budget in force. Provenance for the answer.
+    context_stats: dict = Field(default_factory=dict)
     agent_response: str = ""
     elapsed_ms: float = 0.0
     degraded: bool = False
@@ -502,6 +506,13 @@ def _record_decision(
             "answer_preview": answer[:PREVIEW_CHARS] if (LOG_ANSWER_PREVIEW and answer) else None,
             "context_chars": len(context),
             "context_preview": context[:PREVIEW_CHARS] if (LOG_ANSWER_PREVIEW and context) else None,
+            # Retrieval hygiene, recorded so a duplicate-chunk regression is visible in
+            # the log rather than only in an answer that quietly got worse. Empty on the
+            # tier-1 path and on the graph tier, which compose their own context.
+            "context_chunks_considered": result.context_stats.get("chunks_considered"),
+            "context_chunks_used": result.context_stats.get("chunks_used"),
+            "context_chunks_duplicate": result.context_stats.get("chunks_duplicate"),
+            "context_budget": result.context_stats.get("budget"),
             "tier": _TIER_OF.get(result.routing_decision.strategy.value, "tier4"),
             "lightrag_required": result.rag_configuration.lightrag_required,
             "lightrag_mode": result.rag_configuration.lightrag_mode,
@@ -535,6 +546,7 @@ async def health():
         "lightrag_api": LIGHTRAG_API,
         "lightrag_enabled": LIGHTRAG_ENABLED,
         "vector_timeout_s": EMBEDDING_TIMEOUT_S,
+        "max_context_chars": MAX_CONTEXT_CHARS,
         "llm_host": LLM_HOST,
         "decision_engine_url": DECISION_ENGINE_URL,
         "decision_schemas": sorted(DECISION_SCHEMAS),
@@ -642,6 +654,7 @@ async def query(req: QueryRequest):
         },
         target_agent=result.target_agent.value,
         context_preview=result.context[:500] if result.context else "",
+        context_stats=result.context_stats,
         agent_response=agent_response,
         elapsed_ms=round(elapsed, 2),
         degraded=result.degraded,

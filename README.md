@@ -316,6 +316,57 @@ disk (mtime + size), so rebuilding it does not require a restart. Loading it per
 and because the load is synchronous, it also delayed timer callbacks, which is why the
 classifier's 150 ms budget was observed firing at ~420 ms.
 
+## Context assembly
+
+What reaches the agent is assembled by `assemble_context()` in `core/router.py`, which does two
+things: it drops duplicate chunks, and it fills a character budget instead of taking a fixed
+number of results.
+
+Both were written after an answer came back incomplete. The agent asked for the continuation of
+a tightening sequence, was told the context ended, and was right: the step it wanted sat at rank
+6 of the retriever's 10 results while the router passed `[:3]`. Worse, the three it passed were
+not three different pages — the Espero manual is present in the chunk store twice, under
+`C:\Users\369\Downloads\d_espero\d_espero.pdf` and `d_espero.pdf`, so a third of the context was
+one page twice.
+
+**The duplication is in the source, not in this index.** `storage/jev_fts5.db` is rebuilt from
+`JEV_LIGHTRAG_CHUNKS_PATH` at startup, and that chunk store carries the same document twice:
+865 groups of byte-identical chunks, 1730 of 4562 rows (19%). Cleaning it means re-ingesting a
+document in LightRAG, which also affects the graph and its caches. Deduplicating at the point of
+consumption is the part that belongs here: identical text is never twice useful, and it costs a
+set lookup.
+
+**The budget is 8000 characters by default** (`JEV_MAX_CONTEXT_CHARS`). Measured with
+`scripts/measure_context_budget.py` on four real queries, unique chunks delivered out of the
+retriever's pool:
+
+| budget | query 1 | query 2 | query 3 | query 4 |
+|---|---|---|---|---|
+| 4000 | 4/7 | 6/9 | 7/10 | 4/8 |
+| 6000 | 5/7 | 9/9 | 9/10 | 8/8 |
+| **8000** | **7/7** | **9/9** | **10/10** | **8/8** |
+| 10000 | same as 8000 — the retrieval limit of 10 is what runs out |
+
+8000 is the smallest budget at which the budget stops being the binding constraint. Above it the
+setting does nothing at all.
+
+The old `[:3]` delivered 2360–3078 characters across those queries; 8000 delivers 5402–7569.
+
+The cost of the larger context is smaller than it looks. Same query, two runs per budget,
+alternating: 5.8/7.3 s at 2360 characters in, 7.8/9.6 s at 7569. The spread inside one budget is
+as wide as the gap between them, and longer context produced longer answers, which confounds
+wall-clock further since decode dominates. What the sample does show is the point: answers came
+back 1325–1640 characters at 2360 in and 1838–2449 at 7569. The budget is set for completeness,
+not for microseconds.
+
+Every decision record carries what happened: `context_chars`, `context_chunks_considered`,
+`context_chunks_used`, `context_chunks_duplicate`, `context_budget`. `/health` reports the budget
+in force, and `POST /query` returns the same block as `context_stats`. Without these a duplicate
+regression would be invisible until an answer quietly got worse.
+
+The graph tier is exempt: it composes its own context, and rewriting a synthesised answer is a
+different decision with a different owner.
+
 ## Ground truth: what can be labelled and what cannot
 
 The router cannot judge its own answers, so the logs are split by whose account they are.
@@ -465,6 +516,10 @@ This matters because the router previously ran in a **tmux session**, which is n
 mechanism. A reboot took it down and nothing restarted it or reported it gone — the first sign
 was a consumer's tool call failing. If a service is meant to be reachable, its startup has to be
 owned by init, not by a terminal that happens to be open.
+
+The same reboot also took down the LightRAG API on `:8020`, which this router calls in its graph
+tier. It is the same failure and it has its own unit, kept with that service rather than here:
+`/home/dry/LightRag/deploy/lightrag.service`, installed as `~/.config/systemd/user/lightrag.service`.
 
 ## Observability
 

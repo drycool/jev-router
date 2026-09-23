@@ -45,6 +45,28 @@ EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "mxbai-embed-large")
 # results are served, exactly as when the embedder is unreachable.
 EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "2.0"))
 
+# How much retrieved text the agent is handed, in characters.  A budget rather than a
+# count, because a count cannot know how long a chunk is: the old `[:3]` delivered
+# 2360-3078 characters across four real queries and would deliver 300 on a corpus that
+# happened to produce three short chunks.  What the router owes the agent is a
+# predictable prefill bill, not a fixed number of rows.
+#
+# 8000 is where the budget stops being the binding constraint.  Measured on four real
+# queries (scripts/measure_context_budget.py), unique chunks delivered out of the pool:
+# 4000 chars -> 4/7, 6/9, 7/10, 4/8; 6000 -> 5/7, 9/9, 9/10, 8/8; 8000 -> 7/7, 9/9, 10/10,
+# 8/8; 10000 -> byte-identical to 8000, because by then the retrieval limit of 10 results
+# is what runs out.  Above this value the setting does nothing at all.
+#
+# The cost is smaller than it looks, and it is not the deciding factor.  An A/B of the
+# same query at 2360 and 7569 characters in (two runs each, alternating) came back at
+# 5.8/7.3 s and 7.8/9.6 s - a spread inside one budget as wide as the gap between them,
+# plus the confound that longer context produced longer answers and decode dominates.
+# What the sample does show: answers were 1325-1640 characters at 2360 in and 1838-2449
+# at 7569, i.e. more of the procedure survives.  Prefill is cheap; the budget is set for
+# completeness, not for microseconds.
+MAX_CONTEXT_CHARS = int(os.getenv("JEV_MAX_CONTEXT_CHARS", "8000"))
+CONTEXT_SEPARATOR = "\n\n"
+
 
 class Strategy(str, Enum):
     DIRECT_ACTION = "direct_action"
@@ -104,6 +126,10 @@ class RoutingResult:
     degraded: bool = False
     fallback_reason: Optional[str] = None
     laya_result: dict = field(default_factory=dict)
+    # What assemble_context did with the retrieval pool: how many chunks it considered,
+    # how many it used, how many it dropped as duplicates. Without this the dedup and
+    # the budget are invisible in production and any future regression is unmeasurable.
+    context_stats: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(
@@ -118,6 +144,7 @@ class RoutingResult:
                 "degraded": self.degraded,
                 "fallback_reason": self.fallback_reason,
                 "laya_result": self.laya_result,
+                "context_stats": self.context_stats,
             },
             ensure_ascii=False,
             indent=2,
@@ -276,6 +303,76 @@ def _is_fts_exact(query: str, result: dict) -> bool:
     content_terms = set(re.findall(r"\b[\wа-яА-ЯёЁ]+\b", result["content"].lower()))
     matches = sum(keyword.lower() in content_terms for keyword in keywords)
     return matches >= min(2, len(keywords))
+
+
+def assemble_context(results: list[dict], budget: Optional[int] = None) -> tuple[str, dict]:
+    """Join ranked chunks into the context string handed to the agent.
+
+    Two properties here, both written after measuring a real answer come back
+    incomplete.
+
+    Deduplication.  This FTS index carries the same text more than once - 865 groups of
+    byte-identical chunks, 1730 of 4562 (19%), because the Espero manual was ingested
+    twice under two source paths.  On the query that exposed this, two of the three
+    chunks delivered to the agent were copies of one text, so a third of the context
+    was the same page twice while the step the model actually needed sat at rank 6.
+    The same text is never useful twice; dropping it costs nothing.
+
+    A character budget instead of a chunk count.  Three chunks is not a size and is
+    not even stable across corpora.
+
+    Dedup is on the text with only the edges stripped, never on normalised interior
+    whitespace: chunks that differ mid-text are not duplicates, and collapsing
+    interior whitespace could merge distinct code blocks.
+
+    The first unique chunk is always included whole, even if it alone exceeds the
+    budget - a budget that returns nothing would silently switch retrieval off.
+    Chunks are never split, because half a procedure is worse than a missing one.
+
+    ``budget=None`` reads the module constant at call time rather than binding it as a
+    default, which is what lets the tests patch the value.
+    """
+    if budget is None:
+        budget = MAX_CONTEXT_CHARS
+
+    seen: set[str] = set()
+    parts: list[str] = []
+    used = 0
+    duplicates = 0
+    too_large = 0
+
+    for result in results:
+        content = (result.get("content") or "").strip()
+        if not content:
+            continue
+        if content in seen:
+            duplicates += 1
+            continue
+        seen.add(content)
+
+        separator = len(CONTEXT_SEPARATOR) if parts else 0
+        if parts and used + separator + len(content) > budget:
+            # Skip, do not stop: a long chunk that does not fit must not hide a
+            # shorter unique one ranked behind it.
+            too_large += 1
+            continue
+
+        parts.append(content)
+        used += separator + len(content)
+
+    context = CONTEXT_SEPARATOR.join(parts)
+    stats = {
+        "chunks_considered": len(results),
+        "chunks_used": len(parts),
+        "chunks_duplicate": duplicates,
+        "chunks_too_large": too_large,
+        "chars": len(context),
+        "budget": budget,
+        # True when a unique chunk was dropped for size, i.e. the budget - not the
+        # retrieval pool - was the binding constraint.
+        "budget_exhausted": too_large > 0,
+    }
+    return context, stats
 
 
 def _settled_laya(task: "asyncio.Task[LayaDecision]") -> dict:
@@ -623,7 +720,7 @@ class JevRouter:
         if fts_exact:
             # Nothing in this answer needs the classifier, so nothing here waits
             # for it: the verdict rides along only if it already arrived.
-            context = "\n\n".join(r["content"] for r in fts_exact[:3])
+            context, context_stats = assemble_context(fts_exact)
             return RoutingResult(
                 routing_decision=RoutingDecision(
                     strategy=Strategy.EXACT_FTS,
@@ -643,6 +740,7 @@ class JevRouter:
                 context=context,
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
                 laya_result=_settled_laya(laya_task),
+                context_stats=context_stats,
             )
 
         # The vector index is optional and this installation does have one
@@ -679,7 +777,7 @@ class JevRouter:
         # from the invented taxonomy, and a label that is wrong two times in
         # three must not be able to suppress a good vector hit.
         if best_score >= SIMILARITY_THRESHOLD:
-            context = "\n\n".join(r["content"] for r in vector_results[:5])
+            context, context_stats = assemble_context(vector_results)
             return RoutingResult(
                 routing_decision=RoutingDecision(
                     strategy=Strategy.VECTOR_FAST,
@@ -700,6 +798,7 @@ class JevRouter:
                 context=context,
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
                 laya_result=laya_data,
+                context_stats=context_stats,
             )
 
         # ── Tier 3: LightRAG Graph Search ──
@@ -713,12 +812,17 @@ class JevRouter:
             # serves the same local retrieval a timeout would have served.
             tier3_result = {"response": "", "error_type": "disabled", "elapsed_ms": 0.0}
 
+        # The graph tier composes its own context, so neither the dedup nor the budget is
+        # applied here: assemble_context works on ranked chunks, and rewriting a
+        # synthesised answer is a different decision with a different owner.  The
+        # fall-back below is our own retrieval and does go through it.
         context = tier3_result.get("response", "")
+        context_stats: dict = {}
         fallback_reason = None
         if not context and tier2_results:
             # Degraded-mode fallback: serve retained local retrieval rather
             # than failing the HTTP request when the graph is unavailable.
-            context = "\n\n".join(r["content"] for r in tier2_results[:5])
+            context, context_stats = assemble_context(tier2_results)
             fallback_reason = f"lightrag_{tier3_result.get('error_type', 'empty_response')}"
         elif not context:
             fallback_reason = f"lightrag_{tier3_result.get('error_type', 'empty_response')}"
@@ -746,6 +850,7 @@ class JevRouter:
             degraded=fallback_reason is not None,
             fallback_reason=fallback_reason,
             laya_result=laya_data,
+            context_stats=context_stats,
         )
 
     def _determine_lightrag_mode(self, query: str) -> str:
