@@ -35,7 +35,7 @@ LIGHTRAG_READ_TIMEOUT_S = float(os.getenv("JEV_LIGHTRAG_READ_TIMEOUT_S", "5"))
 # Default preserves the existing behaviour.
 LIGHTRAG_ENABLED = os.getenv("JEV_LIGHTRAG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 EMBEDDING_API = os.getenv("JEV_EMBEDDING_API", "http://192.168.11.87:11434/api/embed")
-EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "mxbai-embed-large")
+EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "bge-m3")
 # Priority for the memory documents in the BM25 ordering.
 #
 # The OCR'd Espero manual is 4414 of the 4623 FTS5 rows and its mangled fragments

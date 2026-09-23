@@ -136,7 +136,7 @@ def main() -> int:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--api", default=os.getenv("JEV_EMBEDDING_API",
                                                    "http://192.168.11.87:11434/api/embed"))
-    parser.add_argument("--model", default=os.getenv("JEV_EMBEDDING_MODEL", "mxbai-embed-large"))
+    parser.add_argument("--model", default=os.getenv("JEV_EMBEDDING_MODEL", "bge-m3"))
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--connect-timeout", type=float, default=2.0)
     parser.add_argument("--read-timeout", type=float, default=60.0)

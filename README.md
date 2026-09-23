@@ -369,7 +369,8 @@ python3 scripts/fingerprint_vectors.py              # corpus fingerprint, before
 | | vectors | file |
 |---|---|---|
 | before | 4593 (4414 OCR manual + 148 Gemini + 31 memory) | 19.5 MB |
-| after | **209** (148 Gemini + 61 memory) | **0.9 MB** |
+| after the cleanup | 209 (148 Gemini + 61 memory) | 0.9 MB |
+| after the embedder migration | **212** (148 Gemini + 64 memory) | 0.9 MB |
 
 The surviving rows are the same vectors, not re-derived ones: the Gemini-corpus fingerprints (sha256 over
 embeddings, chunk ids, contents, sources) are identical before and after the cut. A second merge run
@@ -382,13 +383,65 @@ What the cleanup did and did not fix:
   warm cache reads 0.15 ms. The 330 ms was never the search — it was decompressing 4562×1024 floats.
 - **Espero false positives: fixed.** The 0.80–0.83 garbage is gone because its source is gone; every top-3
   hit is now a golden-corpus row.
-- **Semantic ranking: not fixed, and not fixable by the corpus.** For the paraphrased queries the expected
-  file still ranks near the bottom (best cosine 0.5554 / 0.5861 / 0.5882 — places #154 / #151 / #157 of 209),
-  below the 0.80 gate, so the vector tier returns nothing for them. Measured separability: the smallest
-  cosine against a *correct* target (0.5554) sits far below the largest cosine of an *unrelated* query
-  (0.8669, the Raspberry Pi cable chat). No threshold separates those two sets, so the threshold discussion
-  was the wrong discussion — the geometry is the problem. `mixedbread-ai/mxbai-embed-large-v1` declares
-  `language: [en]` while the corpus and every query here are Russian.
+- **Semantic ranking: not fixed by the corpus** — see the migration below. For the paraphrased queries the
+  expected file ranked near the bottom (best cosine 0.5554 / 0.5861 / 0.5882 — places #154 / #151 / #157 of
+  209) while the smallest cosine against a correct target sat far below the largest cosine of an unrelated
+  query (0.8669, the Raspberry Pi cable chat). No threshold separated those two sets, so the threshold
+  discussion was the wrong discussion — the geometry was the problem.
+  `mixedbread-ai/mxbai-embed-large-v1` declares `language: [en]` while the corpus and every query here are
+  Russian.
+
+### The embedder migration (mxbai-embed-large → bge-m3)
+
+`bge-m3` replaces it: multilingual, 1024 dimensions (so the dimension check and every stored archive format
+are unchanged) and an 8192-token context. Both numbers matter. The old model was an English-only embedder on
+a Russian corpus, and its runner was started with `-c 512`, so a chunk longer than ~512 tokens was silently
+truncated before embedding — the memory chunks run to 1800 characters.
+
+Measured on the 209-row golden corpus, same four control queries:
+
+| query | expected file | mxbai | bge-m3 |
+|---|---|---|---|
+| включать демоны пользователя автоматически при загрузке | `linux_systemd.md` | #169, 0.5602 | **#1, 0.6034** |
+| проверка типов на асинхронных маршрутах | `fastapi_pydantic.md` | #166, 0.5913 | **#1, 0.5684** |
+| как устроена двухслойная конфигурация garageOS и чёрный ящик инцидентов | `garageos.md` | #80, 0.6043 | **#1, 0.6549** |
+| кабели для Raspberry Pi 5 | Gemini cable chats | #1, 0.8555 | #1, 0.6721 |
+
+**4 of 4 targets now rank #1**, and for the first time the corpus is separable: the worst correct target
+scores 0.5684 while genuinely unrelated queries score 0.3773–0.3789. Under mxbai that comparison was
+inverted (worst correct 0.5602 against best unrelated 0.7042) — which is the measurement that showed no
+threshold could work.
+
+Two things the migration measured but did not decide:
+
+- **The `> 0.80` criterion is unreachable on any model**, and it is the wrong criterion: cosine magnitude is
+  a property of a model's geometry, not of correctness. bge-m3 compresses related pairs into 0.57–0.67 where
+  mxbai stretched them to 0.86. Rank and separability are the criteria that transfer; both now pass.
+- **`JEV_SIMILARITY_THRESHOLD=0.80` is now inert** and was left unchanged, because a search threshold is not
+  something to retune without a word. At 0.80 the vector tier returns **zero** chunks for every paraphrase
+  above, so the calls fall through to FTS5. At the measured 0.45 all four come back as `vector_fast` with
+  `entity_type='memory'` chunks while both unrelated controls stay rejected in-process. One environment
+  variable switches it.
+
+A migration is a change of embeddings only, and that is provable rather than plausible: with the corpus and
+the memory slice fingerprinted separately, `chunk_ids`, `contents`, `sources` and `domains` are identical
+before and after, and only `embeddings` moves. The rebuild itself takes **6.8 s** for 212 vectors and is
+deterministic — re-running produces byte-identical vectors.
+
+### Memory priority in the BM25 ordering
+
+The same corpus-versus-manual problem appears in FTS5, where the manual is 4414 of 4626 rows and its mangled
+fragments match ordinary Russian words slightly better than the memory documents do: a question about user
+systemd services returned a chunk about tyre tread (bm25 −8.489 against −8.079 for `linux_systemd.md`).
+`JEV_FTS_MEMORY_BOOST` multiplies bm25 **for memory rows only**; because bm25 is negative and lower is
+better, the factor must be **greater than 1** to promote (1.5 turns −8.079 into −12.1, which wins). A factor
+below 1 demotes memory — an easy sign error, made once here. The reported `score` stays the raw bm25, so the
+decision log never records a relevance a chunk did not score.
+
+The effect is deliberately narrow, and the measurement says why: a boost reorders what already matched, so
+queries with no memory row in the pool are untouched — including the manual query and the off-topic
+controls, which measured identical output at every factor. It fixes shared-ordinary-word collisions and
+nothing more; it cannot make an unseen document appear.
 
 Two more findings from the same run. With the paraphrases the router now answers from FTS5
 (`exact_fts`, 28–40 ms) instead of the vector tier — and the top chunk is often OCR text from the manual,
