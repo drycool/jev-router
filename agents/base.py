@@ -13,8 +13,29 @@ from typing import Optional, Any
 
 import httpx
 
+from core.router import MAX_CONTEXT_CHARS
+
 LLM_CONNECT_TIMEOUT_S = float(os.getenv("JEV_LLM_CONNECT_TIMEOUT_S", "2"))
 LLM_READ_TIMEOUT_S = float(os.getenv("JEV_LLM_READ_TIMEOUT_S", "60"))
+
+# How much of the assembled context reaches the model, in characters.
+#
+# This is the third hard-coded slice found in the same pipeline, and the one that made the
+# first two inert. The router used to pass `[:3]` chunks; each agent then independently cut
+# what it received to 4000 characters (general) or 3000 (code, db, troubleshooter). So the
+# assembly could be fixed and made generous and it still would not matter: on the measured
+# case the tightening sequence sat past character 4000 of a 6058-character context, and the
+# agent answering "my context is incomplete" was reading a prompt that ended before it.
+#
+# Four different numbers for one decision is also why this was invisible: nothing compared
+# them, and the smallest one won silently. There is now one value, it defaults to the
+# assembly budget so the two cannot disagree, and it is the only place the context is cut.
+LLM_CONTEXT_CHARS = int(os.getenv("JEV_LLM_CONTEXT_CHARS", str(MAX_CONTEXT_CHARS)))
+
+
+def _clip_context(context: str) -> str:
+    """The single place context length is limited before a prompt is built."""
+    return context[:LLM_CONTEXT_CHARS]
 
 
 def _llm_timeout() -> httpx.Timeout:
@@ -72,7 +93,7 @@ class GeneralAgent(BaseAgent):
 Если контекста недостаточно, скажи об этом.
 
 КОНТЕКСТ:
-{context[:4000] if context else 'Контекст не найден.'}
+{_clip_context(context) if context else 'Контекст не найден.'}
 
 ВОПРОС: {query}
 
@@ -120,7 +141,7 @@ class CodeAgent(BaseAgent):
 Всегда давай готовые к запуску примеры.
 
 КОНТЕКСТ:
-{context[:3000] if context else ''}
+{_clip_context(context) if context else ''}
 
 ЗАДАЧА: {query}
 
@@ -168,7 +189,7 @@ class DBAgent(BaseAgent):
         prompt = f"""Ты — database expert. Помогай с SQL-запросами, схемами БД, анализом данных.
 
 КОНТЕКСТ БД:
-{context[:3000] if context else 'Нет данных о схеме БД.'}
+{_clip_context(context) if context else 'Нет данных о схеме БД.'}
 
 ЗАПРОС: {query}
 
@@ -216,7 +237,7 @@ class TroubleshooterAgent(BaseAgent):
 Структурируй ответ: 1) Причина 2) Решение 3) Профилактика.
 
 КОНТЕКСТ:
-{context[:3000] if context else ''}
+{_clip_context(context) if context else ''}
 
 ПРОБЛЕМА: {query}
 

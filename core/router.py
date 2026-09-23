@@ -45,26 +45,51 @@ EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "mxbai-embed-large")
 # results are served, exactly as when the embedder is unreachable.
 EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "2.0"))
 
+# How deep retrieval goes before context assembly sees anything.  This is a separate
+# decision from the budget below, and it is the one that decides whether a needed chunk is
+# in the running at all.
+#
+# It was 10, and 10 was not enough: for "затяжка болтов головки блока цилиндров момент" the
+# chunk carrying the complete tightening sequence (stages а-г, 25 Н·м plus the 60°/180°
+# follow-up rotation) sits at rank 13 of the query's matches. At 10 it is absent from the
+# pool, so no assembly policy could deliver it - which is exactly why the agent kept
+# answering that its context was incomplete while the fix to assembly had already landed.
+#
+# At 20 that query yields 16 unique chunks (11720 characters after dedup). Measured cost of
+# the wider pool: 540 chunks in the index match the query's terms, so this is still a
+# shallow slice; bm25 ordering means the depth is not free relevance, and note that the FTS
+# query is an OR over the terms - deeper results are looser. The exact-hit test is what keeps
+# precision, and it is applied unchanged.
+RETRIEVAL_LIMIT = int(os.getenv("JEV_RETRIEVAL_LIMIT", "20"))
+
 # How much retrieved text the agent is handed, in characters.  A budget rather than a
 # count, because a count cannot know how long a chunk is: the old `[:3]` delivered
 # 1691-3078 characters across four real queries and would deliver 300 on a corpus that
 # happened to produce three short chunks.  What the router owes the agent is a
 # predictable prefill bill, not a fixed number of rows.
 #
-# 8000 is where the budget stops being the binding constraint.  Measured on four real
-# queries (scripts/measure_context_budget.py), unique chunks delivered out of the pool:
-# 4000 chars -> 4/7, 6/9, 7/10, 4/8; 6000 -> 5/7, 9/9, 9/10, 8/8; 8000 -> 7/7, 9/9, 10/10,
-# 8/8; 10000 -> byte-identical to 8000, because by then the retrieval limit of 10 results
-# is what runs out.  Above this value the setting does nothing at all.
+# The saturation point moves with the pool size, so these two settings are read together.
+# Unique chunks delivered, out of a 20-result pool, across the four measured queries:
 #
-# The cost is smaller than it looks, and it is not the deciding factor.  An A/B of the
-# same query at 2360 and 7569 characters in (two runs each, alternating) came back at
-# 5.8/7.3 s and 7.8/9.6 s - a spread inside one budget as wide as the gap between them,
-# plus the confound that longer context produced longer answers and decode dominates.
-# What the sample does show: answers were 1325-1640 characters at 2360 in and 1838-2449
-# at 7569, i.e. more of the procedure survives.  Prefill is cheap; the budget is set for
-# completeness, not for microseconds.
-MAX_CONTEXT_CHARS = int(os.getenv("JEV_MAX_CONTEXT_CHARS", "8000"))
+#     budget   query 1   query 2   query 3   query 4
+#       4000      4/7       6/16      7/16      4/16
+#       6000      5/7       9/16      9/16      9/16
+#       8000      7/7      10/16     11/16     12/16
+#      12000      7/7      13/16     15/16     16/16
+#      16000      7/7      16/16     16/16     16/16   <- saturation
+#      20000    byte-identical to 16000; 28000 likewise
+#
+# 16000 is the value. 12000 was tempting - the tightening-sequence query fits all 16 of its
+# chunks there - but on the other three queries it still drops 3, 1 and 0, so it would have
+# repeated the original defect at a smaller scale: a budget quietly cutting the context
+# while the answer looked fine. Setting it at the measured saturation makes the retrieval
+# pool the only limit, and that one is explicit.
+#
+# Measured cost of the larger context, on this hardware, is not the deciding factor: an A/B
+# at 2360 and 7569 characters in (two alternating runs each) came back 5.8/7.3 s and
+# 7.8/9.6 s, a spread within one budget as wide as the gap between them, and a direct LLM
+# measurement put 4000 characters at 16.7 s and 12000 at 10.6 s. Prefill is cheap.
+MAX_CONTEXT_CHARS = int(os.getenv("JEV_MAX_CONTEXT_CHARS", "16000"))
 CONTEXT_SEPARATOR = "\n\n"
 
 
@@ -465,8 +490,14 @@ class Tier2Search:
     def close(self) -> None:
         self.conn.close()
 
-    def search_fts5(self, query: str, limit: int = 10) -> list[dict]:
-        """BM25 full-text search. Returns results in ~2-5ms."""
+    def search_fts5(self, query: str, limit: Optional[int] = None) -> list[dict]:
+        """BM25 full-text search over the top RETRIEVAL_LIMIT matches.
+
+        ``limit=None`` reads the module constant at call time rather than binding it as a
+        default, so the pool depth stays patchable and one setting governs every caller.
+        """
+        if limit is None:
+            limit = RETRIEVAL_LIMIT
         t0 = time.perf_counter()
         # Escape FTS5 special characters
         safe_query = re.sub(r'[^\w\s]', ' ', query)
@@ -503,8 +534,10 @@ class Tier2Search:
             })
         return results
 
-    def search_vector(self, query: str, query_embedding: np.ndarray, limit: int = 10, domain: str = "general") -> list[dict]:
-        """Vector cosine similarity search. ~10-30ms."""
+    def search_vector(self, query: str, query_embedding: np.ndarray, limit: Optional[int] = None, domain: str = "general") -> list[dict]:
+        """Vector cosine similarity search. ~10-30ms. Same pool depth as the FTS path."""
+        if limit is None:
+            limit = RETRIEVAL_LIMIT
         t0 = time.perf_counter()
         index = self._load_vector_index()
         if index is None:

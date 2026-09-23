@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.router import (  # noqa: E402
     MAX_CONTEXT_CHARS,
+    RETRIEVAL_LIMIT,
     Tier2Search,
     _is_fts_exact,
     assemble_context,
@@ -171,7 +172,10 @@ def main() -> int:
     queries = args.query or DEFAULT_QUERIES
     rows = offline(queries, args.budget)
 
-    print(f"budget = {args.budget} chars (JEV_MAX_CONTEXT_CHARS)\n")
+    print(
+        f"budget = {args.budget} chars (JEV_MAX_CONTEXT_CHARS)   "
+        f"pool = {RETRIEVAL_LIMIT} results (JEV_RETRIEVAL_LIMIT)\n"
+    )
     header = f"{'query':44s} {'pool':>4s} {'exact':>5s} {'uniq':>4s} {'dup':>3s} {'old':>6s} {'new':>6s} {'used':>9s}"
     print(header)
     print("-" * len(header))

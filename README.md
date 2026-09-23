@@ -316,57 +316,93 @@ disk (mtime + size), so rebuilding it does not require a restart. Loading it per
 and because the load is synchronous, it also delayed timer callbacks, which is why the
 classifier's 150 ms budget was observed firing at ~420 ms.
 
-## Context assembly
+## What the agent actually reads
 
-What reaches the agent is assembled by `assemble_context()` in `core/router.py`, which does two
-things: it drops duplicate chunks, and it fills a character budget instead of taking a fixed
-number of results.
+Three separate limits decided this, and two of them were invisible. The same class of defect —
+a hard-coded slice where a policy belonged — appeared at three layers, and fixing one layer at a
+time produced no improvement at all, which is the part worth recording.
 
-Both were written after an answer came back incomplete. The agent asked for the continuation of
-a tightening sequence, was told the context ended, and was right: for
-`"затяжка болтов головки блока цилиндров момент"` the step it wanted — Рис. 3.20, the 60°/180°
-follow-up rotation — sat at **rank 6** of the retriever's 10 results while the router passed
-`[:3]`, and the delivered 3128 characters matched the `context_chars: 3128` in that decision
-record. Worse, two of the ten results were byte-identical copies, so the slice spent part of its
-room on the same page twice. After the change the same query delivers 6058 characters, drops
-those two duplicates, and the Рис. 3.20 chunk is present — verified as a substring, not inferred.
+| Layer | Was | Now | Governs |
+|---|---|---|---|
+| Router: how many chunks enter the context | `[:3]` | `assemble_context()`, dedup + character budget | `JEV_MAX_CONTEXT_CHARS` |
+| Retriever: how deep the pool is | 10 results | 20 results | `JEV_RETRIEVAL_LIMIT` |
+| Agent: how much of that context reaches the model | `[:4000]` general, `[:3000]` code/db/troubleshooter | one value | `JEV_LLM_CONTEXT_CHARS` |
 
-**What this fix does not solve, stated because the log will otherwise look like it did**:
-retrieval. Asking the same query through the agent still comes back saying its context is
-incomplete, and it is still right — stage «б» of the sequence is not in the retriever's top 10 at
-all, so no assembly policy can deliver it. The model cannot tell "not retrieved" from "cut off",
-and neither can a reader of the decision log. Recall of the retriever is the next bottleneck, and
-it is a different defect from this one.
+### The case that tied them together
 
-**The duplication is in the source, not in this index.** `storage/jev_fts5.db` is rebuilt from
-`JEV_LIGHTRAG_CHUNKS_PATH` at startup, and that chunk store carries the same document twice:
-865 groups of byte-identical chunks, 1730 of 4562 rows (19%). Cleaning it means re-ingesting a
-document in LightRAG, which also affects the graph and its caches. Deduplicating at the point of
-consumption is the part that belongs here: identical text is never twice useful, and it costs a
-set lookup.
+`"затяжка болтов головки блока цилиндров момент"`. The agent asked for the torque sequence, said
+its context ended, and was right.
 
-**The budget is 8000 characters by default** (`JEV_MAX_CONTEXT_CHARS`). Measured with
-`scripts/measure_context_budget.py` on four real queries, unique chunks delivered out of the
-retriever's pool:
+- The decision record's `context_chars: 3128` matched `[:3]` exactly, so the router was sending
+  three of its ten results — and two of those ten were byte-identical copies, so part of the room
+  went to the same page twice.
+- The chunk carrying the **complete** sequence (stages а–г: 25 Н·м, then 60° three times) sat at
+  **rank 13** of the query's matches. At a pool of 10 it was not in the running at all.
+- With the pool at 20 and assembly delivering all 16 unique chunks, that chunk lands at
+  **characters 6824–7812** of the assembled context — and every agent was cutting its prompt at
+  4000. The context was complete and the model still never saw the stage it needed.
+
+Only after all three were fixed did the answer contain stages а–г, in 10.4 s. Each fix alone was
+inert: the budget could not recover a chunk retrieval never returned, and neither could deliver
+one the prompt truncated away.
+
+### Deduplication
+
+`storage/jev_fts5.db` is rebuilt from `JEV_LIGHTRAG_CHUNKS_PATH` at startup, and that chunk store
+carries the same document twice: 865 groups of byte-identical chunks, 1730 of 4562 rows (19%).
+Dedup is exact text with only the edges stripped, deliberately not whitespace-normalised, so
+chunks that differ mid-text are not merged. On the query above it drops 4 of 20.
+
+Cleaning the chunk store itself means re-ingesting a document in LightRAG, which also affects the
+graph and its caches — a separate decision, not taken here. Deduplicating at the point of
+consumption belongs in this repo: identical text is never twice useful, and it costs a set lookup.
+
+### Budget and pool depth, measured together
+
+The saturation point moves with the pool depth, so these two settings are read as a pair.
+`scripts/measure_context_budget.py` reports both. On four real queries, unique chunks delivered
+out of the pool:
 
 | budget | query 1 | query 2 | query 3 | query 4 |
 |---|---|---|---|---|
-| 4000 | 4/7 | 6/9 | 7/10 | 4/8 |
-| 6000 | 5/7 | 9/9 | 9/10 | 8/8 |
-| **8000** | **7/7** | **9/9** | **10/10** | **8/8** |
-| 10000 | same as 8000 — the retrieval limit of 10 is what runs out |
+| 4000 | 4/7 | 6/16 | 7/16 | 4/16 |
+| 6000 | 5/7 | 9/16 | 9/16 | 9/16 |
+| 8000 | 7/7 | 10/16 | 11/16 | 12/16 |
+| 12000 | 7/7 | 13/16 | 15/16 | 16/16 |
+| **16000** | **7/7** | **16/16** | **16/16** | **16/16** |
+| 20000 | byte-identical to 16000; so is 28000 | | | |
 
-8000 is the smallest budget at which the budget stops being the binding constraint. Above it the
-setting does nothing at all.
+Note the columns: query 1 has only 7 unique chunks in its pool, the others have 16. The default is
+**16000**, the measured saturation point with this pool depth, where the pool rather than the
+budget becomes the constraint. **12000 was the tempting wrong answer** — it fits every chunk of the
+query that started this whole investigation, and still drops 3, 1 and 0 chunks on the other three,
+which is the original defect at a smaller scale: a budget quietly cutting context while the answer
+looks fine.
 
-The old `[:3]` delivered 1691–3078 characters across those queries; 8000 delivers 5402–7569.
+The old `[:3]` delivered 1691–3078 characters across those queries; the current default delivers
+the entire unique pool of all four.
 
-The cost of the larger context is smaller than it looks. Same query, two runs per budget,
-alternating: 5.8/7.3 s at 2360 characters in, 7.8/9.6 s at 7569. The spread inside one budget is
-as wide as the gap between them, and longer context produced longer answers, which confounds
-wall-clock further since decode dominates. What the sample does show is the point: answers came
-back 1325–1640 characters at 2360 in and 1838–2449 at 7569. The budget is set for completeness,
-not for microseconds.
+The cost of the larger context is smaller than it looks and is not the deciding factor. An A/B at
+2360 and 7569 characters in, two alternating runs each, came back 5.8/7.3 s and 7.8/9.6 s — a
+spread inside one budget as wide as the gap between them, confounded further by longer context
+producing longer answers while decode dominates. A direct LLM measurement agrees that prefill is
+cheap: 4000 characters in → 16.7 s / 1547 prompt tokens, 12000 in → 10.6 s / 2373.
+
+### The graph tier is exempt
+
+It composes its own context, so neither the dedup nor the budget is applied — rewriting a
+synthesised answer is a different decision with a different owner. Note that its output *is*
+subject to `JEV_LLM_CONTEXT_CHARS` when the agent builds a prompt, which is why that value should
+be raised alongside `top_k` if the graph tier is ever unparked.
+
+### Observability
+
+Decision records carry `context_chars`, `context_chunks_considered`, `context_chunks_used`,
+`context_chunks_duplicate` and `context_budget`. `/health` reports all three limits:
+`max_context_chars`, `retrieval_limit`, `llm_context_chars`. `POST /query` returns the assembly
+block as `context_stats`, and the MCP server prints it with every answer
+(`context: 16/20 chunks (4 duplicate dropped) · 11718 chars of 16000 budget`), because a truncated
+context and a complete one look identical from the answer alone.
 
 Every decision record carries what happened: `context_chars`, `context_chunks_considered`,
 `context_chunks_used`, `context_chunks_duplicate`, `context_budget`. `/health` reports the budget

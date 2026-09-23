@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from core.router import (
     MAX_CONTEXT_CHARS,
+    RETRIEVAL_LIMIT,
     Tier2Search,
     assemble_context,
 )
@@ -159,6 +160,78 @@ class TheSixthChunkTests(unittest.TestCase):
                 self.assertNotIn("доворачивание", old)
                 self.assertIn("доворачивание", new)
                 search.close()
+
+
+class RetrievalDepthTests(unittest.TestCase):
+    """The pool depth decides whether a chunk is in the running at all.
+
+    This is the defect that survived the context-assembly fix: the agent kept reporting an
+    incomplete context because the chunk holding the complete tightening sequence sat at
+    rank 13 of the query's matches, while the pool stopped at 10. Assembly cannot deliver a
+    chunk that retrieval never returned.
+    """
+
+    QUERY = "затяжка болтов головки блока цилиндров момент"
+
+    def _index(self, search: Tier2Search, fillers: int) -> int:
+        """Index fillers plus one marker chunk; return the marker's 1-based rank.
+
+        The marker is longer than the fillers on purpose: bm25 normalises by document
+        length, so a longer document ranks lower, which is how the real corpus buries the
+        procedure behind shorter, looser matches.
+        """
+        for i in range(fillers):
+            search.index_chunk(
+                f"filler-{i}",
+                f"затяжка болтов головки блока цилиндров момент проба {i} " + "текст " * 40,
+            )
+        search.index_chunk(
+            "sequence",
+            "затяжка болтов головки блока цилиндров момент в несколько этапов: "
+            "а) все болты моментом 25 Н*м, б) затяните моментом, в) доверните на 60 "
+            "градусов, г) доворачивание по схеме Рис. 3.20 " + "описание " * 120,
+        )
+        search.commit()
+        ranked = search.search_fts5(self.QUERY, limit=200)
+        for position, result in enumerate(ranked, start=1):
+            if result["chunk_id"] == "sequence":
+                return position
+        self.fail("the marker chunk is not retrievable at all")
+
+    def test_the_marker_needs_a_deeper_pool_than_the_old_depth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                search = Tier2Search()
+                rank = self._index(search, fillers=12)
+                self.assertGreater(rank, 10, "fixture no longer reproduces the defect")
+                self.assertLessEqual(
+                    rank, 20, "fixture puts the marker beyond the production pool"
+                )
+
+                shallow = [r["chunk_id"] for r in search.search_fts5(self.QUERY, limit=10)]
+                self.assertNotIn("sequence", shallow)
+
+                deep = [r["chunk_id"] for r in search.search_fts5(self.QUERY, limit=20)]
+                self.assertIn("sequence", deep)
+                search.close()
+
+    def test_the_pool_depth_comes_from_the_constant_not_a_bound_default(self):
+        """One setting governs every caller, and it stays patchable."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                search = Tier2Search()
+                self._index(search, fillers=12)
+                with patch("core.router.RETRIEVAL_LIMIT", 4):
+                    self.assertEqual(len(search.search_fts5(self.QUERY)), 4)
+                with patch("core.router.RETRIEVAL_LIMIT", 20):
+                    # The pool is capped by the constant, not by a value bound at import
+                    # time, and capped by the available matches rather than by the limit.
+                    self.assertEqual(len(search.search_fts5(self.QUERY)), 13)
+                search.close()
+
+    def test_the_default_pool_is_wide_enough_for_the_measured_case(self):
+        """A guard on the constant itself: 10 was measured to be too shallow."""
+        self.assertGreaterEqual(RETRIEVAL_LIMIT, 13)
 
 
 if __name__ == "__main__":

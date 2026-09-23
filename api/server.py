@@ -37,6 +37,7 @@ from core.laya_client import LAYA_CONFIDENCE_THRESHOLD, LAYA_URL
 from core.router import (
     EMBEDDING_TIMEOUT_S,
     MAX_CONTEXT_CHARS,
+    RETRIEVAL_LIMIT,
     AgentType,
     JevRouter,
     LIGHTRAG_ENABLED,
@@ -47,6 +48,7 @@ from core.shadow import ShadowProbe, ShadowTarget
 from agents.base import (
     GeneralAgent, CodeAgent, DBAgent, TroubleshooterAgent,
     AgentResponse,
+    LLM_CONTEXT_CHARS,
 )
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -546,7 +548,13 @@ async def health():
         "lightrag_api": LIGHTRAG_API,
         "lightrag_enabled": LIGHTRAG_ENABLED,
         "vector_timeout_s": EMBEDDING_TIMEOUT_S,
+        # The three numbers that decide what the agent actually reads. They are reported
+        # together because they were once four unrelated hard-coded values - a 3-chunk
+        # slice in the router and 4000/3000/3000/3000 in the agents - and the smallest of
+        # them silently won. Anything that limits context belongs in this block.
         "max_context_chars": MAX_CONTEXT_CHARS,
+        "retrieval_limit": RETRIEVAL_LIMIT,
+        "llm_context_chars": LLM_CONTEXT_CHARS,
         "llm_host": LLM_HOST,
         "decision_engine_url": DECISION_ENGINE_URL,
         "decision_schemas": sorted(DECISION_SCHEMAS),
