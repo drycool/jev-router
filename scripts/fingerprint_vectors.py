@@ -21,7 +21,20 @@ memory_mask = np.asarray([str(cid).startswith("mem:") for cid in chunk_ids])
 corpus_mask = ~memory_mask
 
 def digest(array) -> str:
-    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()[:16]
+    """sha256 of the array's *contents*, independent of numpy's dtype.
+
+    For string arrays numpy pads to the widest element, so `.tobytes()` changes
+    when the widest string changes even though no text did: a model migration
+    dropped the maximum chunk length from 1901 to 1877 characters and this
+    function reported "contents changed" for all 209 rows.  Text is therefore
+    hashed as its UTF-8 bytes, not as fixed-width records.
+    """
+    array = np.ascontiguousarray(array)
+    if array.dtype.kind in {"U", "S", "O"}:
+        payload = b"\x00".join(str(item).encode("utf-8") for item in array.ravel())
+    else:
+        payload = array.tobytes()
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 print(f"файл        : {path} ({path.stat().st_size / 1e6:.1f} MB, "
       f"mtime {int(path.stat().st_mtime_ns)})")
@@ -39,6 +52,13 @@ print(f"  contents   : {digest(data['contents'][corpus_mask])}")
 print(f"  sources    : {digest(data['sources'][corpus_mask])}")
 print(f"  domains    : {digest(data['domains'][corpus_mask])}")
 if memory_mask.any():
+    # Same evidence for the memory slice: a model migration must change the
+    # embeddings and nothing else, so these four must match across the rebuild.
+    print("\nотпечатки ПАМЯТИ (при смене модели должны совпасть, в отличие от embeddings):")
+    print(f"  chunk_ids  : {digest(chunk_ids[memory_mask])}")
+    print(f"  contents   : {digest(data['contents'][memory_mask])}")
+    print(f"  sources    : {digest(data['sources'][memory_mask])}")
+    print(f"  domains    : {digest(data['domains'][memory_mask])}")
     print("\nстроки памяти:")
     for cid, etype, source in zip(chunk_ids[memory_mask], entity_types[memory_mask],
                                   data["sources"][memory_mask]):
