@@ -36,6 +36,27 @@ LIGHTRAG_READ_TIMEOUT_S = float(os.getenv("JEV_LIGHTRAG_READ_TIMEOUT_S", "5"))
 LIGHTRAG_ENABLED = os.getenv("JEV_LIGHTRAG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 EMBEDDING_API = os.getenv("JEV_EMBEDDING_API", "http://192.168.11.87:11434/api/embed")
 EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "mxbai-embed-large")
+# Priority for the memory documents in the BM25 ordering.
+#
+# The OCR'd Espero manual is 4414 of the 4623 FTS5 rows and its mangled fragments
+# match ordinary Russian words *slightly* better than the memory documents do,
+# which is how a question about user systemd services came back with a chunk
+# about tyre tread (rank -8.489 against -8.079 for linux_systemd.md).  The
+# manual stays in FTS5 - literal matching there is not the problem - so the fix
+# belongs in the ordering, not in the corpus.
+#
+# The factor multiplies bm25() **for memory rows only**, and bm25() is negative
+# with lower = better, so a factor **greater than 1** is what promotes a row:
+# -8.079 * 1.5 = -12.1, which now beats -8.489.  A factor below 1 would demote
+# memory, which is the opposite of the intent and an easy sign error to make.
+#
+# 1.5 is the smallest measured value that moves the shared-stop-word case, and
+# it is deliberately mild: the boost reorders rows that already matched, it does
+# not add rows, so a query with no memory chunk in the pool is unaffected (the
+# manual query and the off-topic controls have zero memory rows in the pool and
+# measured identical output at every factor).  Set JEV_FTS_MEMORY_BOOST=1 to
+# disable the reordering entirely.
+FTS_MEMORY_BOOST = float(os.getenv("JEV_FTS_MEMORY_BOOST", "1.5"))
 # Total budget for the embedding call, enforced with asyncio.timeout (same reason as the
 # classifier: an httpx timeout is per socket read, not a deadline). The embedder lives on
 # the node that powers itself off when idle, and this is the fall-through path's only
@@ -514,12 +535,14 @@ class Tier2Search:
         try:
             rows = self.conn.execute(
                 """SELECT chunk_id, content, source, entity_type,
-                          rank AS score
+                          rank AS score,
+                          rank * (CASE WHEN entity_type = 'memory' THEN ? ELSE 1.0 END)
+                              AS weighted
                    FROM chunks
                    WHERE chunks MATCH ?
-                   ORDER BY rank
+                   ORDER BY weighted
                    LIMIT ?""",
-                (fts_query, limit),
+                (FTS_MEMORY_BOOST, fts_query, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             return []
@@ -531,7 +554,10 @@ class Tier2Search:
                 "content": row[1],
                 "source": row[2],
                 "entity_type": row[3],
-                # bm25() returns a negative rank; lower is more relevant.
+                # bm25() returns a negative rank; lower is more relevant.  This is
+                # the raw value, not the memory-weighted one used for ordering:
+                # the decision log records what the corpus actually scored, and a
+                # boosted number there would be a fabricated relevance.
                 "score": abs(float(row[4])),
                 "search_type": "fts5",
                 "elapsed_ms": (time.perf_counter() - t0) * 1000,
