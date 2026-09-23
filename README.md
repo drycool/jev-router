@@ -323,11 +323,20 @@ things: it drops duplicate chunks, and it fills a character budget instead of ta
 number of results.
 
 Both were written after an answer came back incomplete. The agent asked for the continuation of
-a tightening sequence, was told the context ended, and was right: the step it wanted sat at rank
-6 of the retriever's 10 results while the router passed `[:3]`. Worse, the three it passed were
-not three different pages — the Espero manual is present in the chunk store twice, under
-`C:\Users\369\Downloads\d_espero\d_espero.pdf` and `d_espero.pdf`, so a third of the context was
-one page twice.
+a tightening sequence, was told the context ended, and was right: for
+`"затяжка болтов головки блока цилиндров момент"` the step it wanted — Рис. 3.20, the 60°/180°
+follow-up rotation — sat at **rank 6** of the retriever's 10 results while the router passed
+`[:3]`, and the delivered 3128 characters matched the `context_chars: 3128` in that decision
+record. Worse, two of the ten results were byte-identical copies, so the slice spent part of its
+room on the same page twice. After the change the same query delivers 6058 characters, drops
+those two duplicates, and the Рис. 3.20 chunk is present — verified as a substring, not inferred.
+
+**What this fix does not solve, stated because the log will otherwise look like it did**:
+retrieval. Asking the same query through the agent still comes back saying its context is
+incomplete, and it is still right — stage «б» of the sequence is not in the retriever's top 10 at
+all, so no assembly policy can deliver it. The model cannot tell "not retrieved" from "cut off",
+and neither can a reader of the decision log. Recall of the retriever is the next bottleneck, and
+it is a different defect from this one.
 
 **The duplication is in the source, not in this index.** `storage/jev_fts5.db` is rebuilt from
 `JEV_LIGHTRAG_CHUNKS_PATH` at startup, and that chunk store carries the same document twice:
@@ -350,7 +359,7 @@ retriever's pool:
 8000 is the smallest budget at which the budget stops being the binding constraint. Above it the
 setting does nothing at all.
 
-The old `[:3]` delivered 2360–3078 characters across those queries; 8000 delivers 5402–7569.
+The old `[:3]` delivered 1691–3078 characters across those queries; 8000 delivers 5402–7569.
 
 The cost of the larger context is smaller than it looks. Same query, two runs per budget,
 alternating: 5.8/7.3 s at 2360 characters in, 7.8/9.6 s at 7569. The spread inside one budget is

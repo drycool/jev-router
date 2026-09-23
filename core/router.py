@@ -47,7 +47,7 @@ EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "2.0"))
 
 # How much retrieved text the agent is handed, in characters.  A budget rather than a
 # count, because a count cannot know how long a chunk is: the old `[:3]` delivered
-# 2360-3078 characters across four real queries and would deliver 300 on a corpus that
+# 1691-3078 characters across four real queries and would deliver 300 on a corpus that
 # happened to produce three short chunks.  What the router owes the agent is a
 # predictable prefill bill, not a fixed number of rows.
 #
