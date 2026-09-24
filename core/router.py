@@ -100,10 +100,22 @@ FTS_GATE_RAW_EXIT_TERMS = int(os.getenv("JEV_FTS_GATE_RAW_EXIT_TERMS", "4"))
 # classifier: an httpx timeout is per socket read, not a deadline). The embedder lives on
 # the node that powers itself off when idle, and this is the fall-through path's only
 # remaining GPU dependency - a 30 s client timeout let a sleeping node stall a request for
-# almost that long (observed ~16 s while the box was coming up). Healthy cost is ~32 ms,
-# so this is ~60x headroom. On expiry the vector layer is skipped and the local FTS
-# results are served, exactly as when the embedder is unreachable.
-EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "2.0"))
+# almost that long (observed ~16 s while the box was coming up). Healthy cost is 47-104 ms.
+# On expiry the vector layer is skipped, the local FTS results are served, and the request
+# is reported as embedding_timeout with degraded=true.
+#
+# The value must cover a COLD LOAD, not just a warm call, and the default used to fail that
+# requirement: measured on the same endpoint, an unloaded model costs 2124 ms for the first
+# call against 47 ms for the second, and the old default of 2.0 s sat 100 ms below that
+# price. Paying a budget you know is too short is worse than not waiting at all, because
+# ollama completes the load in the background regardless - so the 2 s were spent, the answer
+# was discarded, and only the next request benefited. The comment further down already
+# recorded a 4163 ms cold load while relying on keep_alive to make it never happen; keep_alive
+# does not survive eviction by another model on the shared card, so it does happen.
+# 3.5 s covers the load with margin for a contended card (observed 2100-2800 ms).
+# Kept equal to JEV_VECTOR_TIMEOUT_S in .env on purpose: tests do not load .env, and a
+# default that disagrees with production is how a budget regression stays invisible.
+EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "3.5"))
 # How long the embedder is kept loaded on GPU2.  The embedder and the answer
 # model share one 12 GB card and ollama unloads an un-kept model, so without
 # this the embedding call reloads bge-m3 (4163 ms measured cold) and busts the
