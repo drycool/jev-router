@@ -307,25 +307,48 @@ async def lifespan(app: FastAPI):
 # waiting.  The timeout is generous because this call is allowed to take as long
 # as a model load takes - moving it off the request path is the entire point.
 EMBEDDING_WARMUP_TIMEOUT_S = float(os.getenv("JEV_EMBEDDING_WARMUP_TIMEOUT_S", "30"))
+# Inputs for the warm-up, in increasing length.  See _warm_embedder for why more than one
+# call is needed on a CPU runner, and why the lengths vary rather than repeat.
+EMBEDDING_WARMUP_INPUTS = (
+    "warmup",
+    "прогрев эмбеддера",
+    "проверка готовности модели к работе с запросами пользователя",
+    "проверка готовности модели к работе с запросами пользователя " * 8,
+)
 _warmup_task: asyncio.Task | None = None
 
 
 async def _warm_embedder() -> None:
-    """Load the embedder off the request path.  Best effort: failures are logged."""
+    """Load the embedder off the request path, and spend its first-call costs here.
+
+    One call is not enough on a CPU runner.  Measured on the CPU-only instance: a single
+    warm-up call left the first several *real* calls paying 1.5-6.6 s each (graph
+    construction, thread-pool spin-up, first touches of the mapped weights), while the same
+    instance served 41 consecutive calls at 43-116 ms once it had been used a handful of
+    times - including 16 input lengths the warm-up never sent.  So the cost is per runner
+    start, not per input, and it can be paid here instead of by a user's query.  Lengths
+    below span the range a real query occupies; the last one is deliberately long.
+    """
     import httpx
 
     started = time.perf_counter()
+    slowest_ms = 0.0
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(EMBEDDING_WARMUP_TIMEOUT_S)) as client:
-            response = await client.post(
-                EMBEDDING_API,
-                json={"model": EMBEDDING_MODEL, "input": "warmup",
-                      "keep_alive": EMBEDDING_KEEP_ALIVE},
-            )
-            response.raise_for_status()
+            for text in EMBEDDING_WARMUP_INPUTS:
+                call_started = time.perf_counter()
+                response = await client.post(
+                    EMBEDDING_API,
+                    json={"model": EMBEDDING_MODEL, "input": text,
+                          "keep_alive": EMBEDDING_KEEP_ALIVE},
+                )
+                response.raise_for_status()
+                slowest_ms = max(slowest_ms, (time.perf_counter() - call_started) * 1000)
         elapsed_ms = (time.perf_counter() - started) * 1000
-        print(f"[Jev] embedder warm in {elapsed_ms:.0f} ms (keep_alive={EMBEDDING_KEEP_ALIVE}); "
-              f"the first query will not pay for the load", flush=True)
+        print(f"[Jev] embedder warm in {elapsed_ms:.0f} ms over "
+              f"{len(EMBEDDING_WARMUP_INPUTS)} calls (slowest {slowest_ms:.0f} ms, "
+              f"keep_alive={EMBEDDING_KEEP_ALIVE}); the first query will not pay for the load",
+              flush=True)
     except Exception as error:
         print(f"[Jev] embedder warm-up skipped ({type(error).__name__}: {error}); "
               f"the first query will pay for the load", flush=True)

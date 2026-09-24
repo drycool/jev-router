@@ -37,7 +37,15 @@ LIGHTRAG_READ_TIMEOUT_S = float(os.getenv("JEV_LIGHTRAG_READ_TIMEOUT_S", "5"))
 # serves exactly the context the timeout path would have served, without the wait.
 # Default preserves the existing behaviour.
 LIGHTRAG_ENABLED = os.getenv("JEV_LIGHTRAG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
-EMBEDDING_API = os.getenv("JEV_EMBEDDING_API", "http://192.168.11.87:11434/api/embed")
+# The embedder runs on a CPU-only instance of ollama (port 11435), not the GPU one.
+# Measured: the GPU instance drops bge-m3 when a fresh large model is loaded, even with
+# 7228 MiB of the card free and keep_alive=24h - the fitter's decision, not memory
+# pressure - and the reload then costs 4656 ms against a 5.5 s budget.  Keeping the
+# embedder off the card removes the reload instead of paying for it.  Same binary and the
+# same model files, only CUDA hidden, so the embedding geometry is unchanged (cos
+# 0.999992-0.999994 against the GPU instance) and the index needs no rebuild.
+# Kept equal to JEV_EMBEDDING_API in .env on purpose: tests do not load .env.
+EMBEDDING_API = os.getenv("JEV_EMBEDDING_API", "http://192.168.11.87:11435/api/embed")
 EMBEDDING_MODEL = os.getenv("JEV_EMBEDDING_MODEL", "bge-m3")
 # Priority for the memory documents in the BM25 ordering.
 #
@@ -115,7 +123,7 @@ FTS_GATE_RAW_EXIT_TERMS = int(os.getenv("JEV_FTS_GATE_RAW_EXIT_TERMS", "4"))
 # 3.5 s covers the load with margin for a contended card (observed 2100-2800 ms).
 # Kept equal to JEV_VECTOR_TIMEOUT_S in .env on purpose: tests do not load .env, and a
 # default that disagrees with production is how a budget regression stays invisible.
-EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "3.5"))
+EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "5.5"))
 # How long the embedder is kept loaded on GPU2.  The embedder and the answer
 # model share one 12 GB card and ollama unloads an un-kept model, so without
 # this the embedding call reloads bge-m3 (4163 ms measured cold) and busts the
