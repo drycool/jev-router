@@ -279,12 +279,41 @@ class RouterTests(unittest.TestCase):
                     result = asyncio.run(router.route("torque of the cylinder head bolts"))
                     elapsed = time.perf_counter() - started
 
-                    self.assertEqual(result.routing_decision.strategy, Strategy.EXACT_FTS)
+                    self.assertEqual(result.routing_decision.strategy, Strategy.FTS_FALLBACK)
+                    self.assertEqual(result.routing_decision.confidence_score, 0.5)
                     self.assertFalse(result.degraded)
                     self.assertIsNone(result.fallback_reason)
                     self.assertIn("Torque settings", result.context)
                     self.assertFalse(result.rag_configuration.lightrag_required)
                     self.assertLess(elapsed, 0.5)
+                    router.tier2.close()
+
+    def test_nothing_local_at_all_is_not_labelled_as_an_fts_fallback(self):
+        """A pool that failed the gate and a corpus that matched nothing are both
+        low-confidence, but only one of them has rows behind it.  Labelling the
+        empty case fts_fallback would name a tier that produced nothing, which is
+        the same substitution this branch already had to be fixed for twice."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                with patch("core.router.LIGHTRAG_ENABLED", False):
+                    router = JevRouter()
+
+                    class Laya:
+                        async def predict_routing(self, _):
+                            return LayaDecision(strategy="general_fallback", status="success")
+
+                    async def no_embedding(_):
+                        return None
+
+                    router.laya = Laya()
+                    router.get_embedding = no_embedding
+
+                    result = asyncio.run(router.route("qwertyuiop zxcvbnm asdfghjkl"))
+
+                    self.assertEqual(result.routing_decision.strategy, Strategy.GENERAL_LLM)
+                    self.assertEqual(result.routing_decision.confidence_score, 0.0)
+                    self.assertEqual(result.context, "")
+                    self.assertFalse(result.degraded)
                     router.tier2.close()
 
     def test_parked_graph_tier_labels_a_vector_served_answer_as_vector(self):

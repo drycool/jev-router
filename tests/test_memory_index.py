@@ -11,6 +11,7 @@ The pipeline tests run against a real FTS5 table (a temporary database, same
 virtual table the router creates), because a test that only checks a returned
 list proves nothing about what the index actually contains afterwards.
 """
+import asyncio
 import importlib
 import os
 import tempfile
@@ -204,6 +205,29 @@ class ServerWiringTests(unittest.TestCase):
         source = self._source()
         self.assertIn("async def _index_memory_docs():", source)
         self.assertIn("from core.memory_index import", source)
+
+    def test_the_embedder_is_warmed_without_being_awaited(self):
+        """The warm-up has to happen, and has to happen off the request path.
+
+        Awaiting it would make startup depend on GPU2 being awake - the rule that
+        keeps the memory vectors an explicit build step - and a 30 s timeout there
+        would hold the port closed while the health check reports nothing.
+        """
+        source = self._source()
+        memory_call = source.index("await _index_memory_docs()")
+        warm_call = source.index("asyncio.create_task(_warm_embedder())")
+        self.assertLess(memory_call, warm_call)
+        self.assertNotIn("await _warm_embedder()", source,
+                         "the warm-up must not be awaited in the lifespan")
+
+    def test_a_failing_warm_up_does_not_break_startup(self):
+        """GPU2 asleep is a normal state here, not a start-up failure."""
+        import api.server as server
+
+        with patch.object(server, "EMBEDDING_WARMUP_TIMEOUT_S", 0.2), \
+             patch.object(server, "EMBEDDING_API", "http://127.0.0.1:9/api/embed"):
+            # Port 9 is discard: the connection is refused rather than hanging.
+            asyncio.run(server._warm_embedder())
 
 
 if __name__ == "__main__":

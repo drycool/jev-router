@@ -106,12 +106,22 @@ FTS_GATE_RAW_EXIT_TERMS = int(os.getenv("JEV_FTS_GATE_RAW_EXIT_TERMS", "4"))
 EMBEDDING_TIMEOUT_S = float(os.getenv("JEV_VECTOR_TIMEOUT_S", "2.0"))
 # How long the embedder is kept loaded on GPU2.  The embedder and the answer
 # model share one 12 GB card and ollama unloads an un-kept model, so without
-# this the embedding call reloads bge-m3 (4163 ms measured) and busts the budget
-# above every time the answer model is resident - the vector tier then drops
-# out of every request without saying so.  Bounded rather than infinite on
-# purpose: a permanently pinned embedder would take the VRAM the 10 GB model
-# needs when GPU2 is switched to that workload.
-EMBEDDING_KEEP_ALIVE = os.getenv("JEV_EMBEDDING_KEEP_ALIVE", "30m")
+# this the embedding call reloads bge-m3 (4163 ms measured cold) and busts the
+# budget above every time the answer model is resident - the vector tier then
+# drops out of every request without saying so.  Measured warm: 59 ms.
+#
+# 30m was too short in practice.  The cost is paid by the first request after
+# idle, which is exactly when a reactive router is being judged: measured after
+# a 30-minute gap, the embedder was gone and the call took 4.2 s against this
+# budget, so the vector tier was skipped and the query fell to local rows.  24h
+# keeps it hot across a working day without pinning it forever, which a -1 would
+# do at the expense of the 10 GB model that also lives on this card.
+EMBEDDING_KEEP_ALIVE = os.getenv("JEV_EMBEDDING_KEEP_ALIVE", "24h")
+
+# Confidence carried by fts_fallback: local rows were found, none of them matched
+# decisively (the gate declined the early exit), so the floor of that status's
+# band is used and no relevance is claimed.
+FTS_FALLBACK_CONFIDENCE = float(os.getenv("JEV_FTS_FALLBACK_CONFIDENCE", "0.5"))
 
 # How deep retrieval goes before context assembly sees anything.  This is a separate
 # decision from the budget below, and it is the one that decides whether a needed chunk is
@@ -167,6 +177,13 @@ class Strategy(str, Enum):
     VECTOR_FAST = "vector_fast"
     GRAPH_LIGHTRAG = "graph_lightrag"
     GENERAL_LLM = "general_llm"
+    # Local rows served without a decisive match: the pool exists but failed the
+    # gate, so this is the lower tier taken with nothing relevant in it.  Kept
+    # distinct from exact_fts because a caller that cannot tell them apart reads a
+    # weak pool as an answer.  Confidence stays at the floor of its band - rows
+    # were found, nothing matched decisively, and any number above the floor would
+    # claim a relevance the gate declined.
+    FTS_FALLBACK = "fts_fallback"
 
 
 class AgentType(str, Enum):
@@ -1067,16 +1084,42 @@ class JevRouter:
                 context_results = tier2_results
             if context_results:
                 context, context_stats = assemble_context(context_results)
-            served_by_vector = bool(vector_results)
+
+            # Name the tier that answered, and say plainly when nothing did.  Three
+            # outcomes live here, and running them together under one label is what
+            # this branch got wrong twice: first as graph_lightrag (an outage that
+            # never happened), then as exact_fts 0.7 (a decisive-hit label on a pool
+            # the gate had just refused).  A caller that cannot tell a weak pool from
+            # an answer reads the weak pool as the answer.
+            #
+            #   vector hits arrived   -> vector_fast, with the real cosine
+            #   local rows, no gate   -> fts_fallback, floor confidence
+            #   nothing local at all  -> general_llm, no context
+            #
+            # The third case is not a fallback to FTS - there is no FTS row behind
+            # it - so it is not labelled as one.  It is the only case where the
+            # model has to answer by itself, and saying so is the point.
+            if vector_results:
+                strategy = Strategy.VECTOR_FAST
+                confidence = best_score
+                intent = "vector_search"
+            elif context_results:
+                strategy = Strategy.FTS_FALLBACK
+                confidence = FTS_FALLBACK_CONFIDENCE
+                intent = "exact_search"
+            else:
+                strategy = Strategy.GENERAL_LLM
+                confidence = 0.0
+                intent = "general"
 
             return RoutingResult(
                 routing_decision=RoutingDecision(
-                    strategy=Strategy.VECTOR_FAST if served_by_vector else Strategy.EXACT_FTS,
-                    confidence_score=best_score if served_by_vector else 0.7,
+                    strategy=strategy,
+                    confidence_score=confidence,
                     fast_path_exit=False,
                 ),
                 extracted_metadata=ExtractedMetadata(
-                    intent="vector_search" if served_by_vector else "exact_search",
+                    intent=intent,
                     keywords=_extract_keywords(query),
                     entities=self._extract_entities(query),
                     domain=domain,

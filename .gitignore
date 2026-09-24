@@ -11,6 +11,9 @@ __pycache__/
 .ruff_cache/
 
 *.log
+# The unit appends its stdout here (StandardOutput=append:), and a snapshot taken
+# while replacing it carries a date suffix that *.log does not match.
+jev_server.log.stale-*
 *.pid
 # Decision and feedback logs carry answer previews and verdicts; they stay local.
 jev_decisions.jsonl

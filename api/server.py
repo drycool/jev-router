@@ -35,6 +35,9 @@ from core.decision_engine import (
 )
 from core.laya_client import LAYA_CONFIDENCE_THRESHOLD, LAYA_URL
 from core.router import (
+    EMBEDDING_API,
+    EMBEDDING_KEEP_ALIVE,
+    EMBEDDING_MODEL,
     EMBEDDING_TIMEOUT_S,
     MAX_CONTEXT_CHARS,
     RETRIEVAL_LIMIT,
@@ -246,11 +249,56 @@ async def lifespan(app: FastAPI):
     # Then the working-memory documents.  Order matters: the rebuild above starts
     # with clear(), so anything indexed before it would be deleted immediately.
     await _index_memory_docs()
+    # Then pull the embedder into memory while nobody is waiting.  Not awaited:
+    # see _warm_embedder for why a start must not block on GPU2.
+    global _warmup_task
+    _warmup_task = asyncio.create_task(_warm_embedder())
 
     yield
+    if _warmup_task is not None and not _warmup_task.done():
+        _warmup_task.cancel()
     await shadow_probe.aclose()
     await router.laya.aclose()
     router.tier2.close()
+
+
+# Loading the embedder is a start-up cost, not a request cost.
+#
+# Keeping the embedder resident (JEV_EMBEDDING_KEEP_ALIVE=24h) stops it being
+# evicted while idle, but it cannot help a request that arrives before anything
+# has loaded it.  Measured on a cold start, that call takes 4.2-4.4 s against the
+# 2.0 s vector budget, so it times out and the query falls to the local rows -
+# which put one request in that position after *every* restart, and that request
+# is the one an operator runs first to check the service.
+#
+# Deliberately not awaited in the lifespan: a start must not depend on GPU2 being
+# awake (the same rule that keeps the memory vectors an explicit build step), so
+# startup finishes and the load proceeds behind a request that is not yet
+# waiting.  The timeout is generous because this call is allowed to take as long
+# as a model load takes - moving it off the request path is the entire point.
+EMBEDDING_WARMUP_TIMEOUT_S = float(os.getenv("JEV_EMBEDDING_WARMUP_TIMEOUT_S", "30"))
+_warmup_task: asyncio.Task | None = None
+
+
+async def _warm_embedder() -> None:
+    """Load the embedder off the request path.  Best effort: failures are logged."""
+    import httpx
+
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(EMBEDDING_WARMUP_TIMEOUT_S)) as client:
+            response = await client.post(
+                EMBEDDING_API,
+                json={"model": EMBEDDING_MODEL, "input": "warmup",
+                      "keep_alive": EMBEDDING_KEEP_ALIVE},
+            )
+            response.raise_for_status()
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        print(f"[Jev] embedder warm in {elapsed_ms:.0f} ms (keep_alive={EMBEDDING_KEEP_ALIVE}); "
+              f"the first query will not pay for the load", flush=True)
+    except Exception as error:
+        print(f"[Jev] embedder warm-up skipped ({type(error).__name__}: {error}); "
+              f"the first query will pay for the load", flush=True)
 
 
 async def _index_lightrag_chunks():
