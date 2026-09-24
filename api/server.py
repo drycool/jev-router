@@ -649,6 +649,10 @@ def _record_decision(
         "decision": {
             "strategy": result.routing_decision.strategy.value,
             "confidence": result.routing_decision.confidence_score,
+            # Recorded next to the strategy it summarises, so a label study can group by the
+            # coarse question ("may facts be stated?") without re-deriving it from the
+            # taxonomy - and so a drift between the two would be visible in the log itself.
+            "local_material_decisive": result.routing_decision.local_material_decisive,
             "keywords": result.extracted_metadata.keywords,
             "entities": result.extracted_metadata.entities,
             "domain": result.extracted_metadata.domain,
@@ -799,6 +803,9 @@ async def query(req: QueryRequest):
             "strategy": result.routing_decision.strategy.value,
             "confidence_score": result.routing_decision.confidence_score,
             "fast_path_exit": result.routing_decision.fast_path_exit,
+            # The one bit a consumer needs to decide whether it may state facts about the
+            # project. Derived from the strategy, so it cannot disagree with it.
+            "local_material_decisive": result.routing_decision.local_material_decisive,
         },
         extracted_metadata={
             "intent": result.extracted_metadata.intent,
@@ -961,6 +968,9 @@ async def route_only(query: str = Query(..., min_length=1, max_length=16000)):
             "strategy": result.routing_decision.strategy.value,
             "confidence_score": result.routing_decision.confidence_score,
             "fast_path_exit": result.routing_decision.fast_path_exit,
+            # The one bit a consumer needs to decide whether it may state facts about the
+            # project. Derived from the strategy, so it cannot disagree with it.
+            "local_material_decisive": result.routing_decision.local_material_decisive,
         },
         "extracted_metadata": {
             "intent": result.extracted_metadata.intent,

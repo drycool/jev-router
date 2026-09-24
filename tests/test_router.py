@@ -730,6 +730,47 @@ def _laya_response(strategy="direct_cmd", domain="general", confidence=0.91, sta
     )
 
 
+class LocalMaterialDecisiveTests(unittest.TestCase):
+    """The single bit a consumer reads instead of interpreting the taxonomy.
+
+    Eight statuses are precise and easy to misread one at a time; the history of this
+    branch is exactly a consumer reading a weak pool as an answer and a broken retriever as
+    a verdict on the corpus.  So the coarse question - may facts about the project be
+    stated from this? - gets its own answer, derived from the strategy rather than set
+    beside it, and these tests pin the derivation to the whole enum.
+    """
+
+    def test_only_the_two_decisive_statuses_allow_stating_facts(self):
+        decisive = {Strategy.EXACT_FTS, Strategy.VECTOR_FAST}
+        for strategy in Strategy:
+            with self.subTest(strategy=strategy):
+                decision = RoutingDecision(strategy=strategy, confidence_score=0.9,
+                                           fast_path_exit=False)
+                self.assertEqual(decision.local_material_decisive, strategy in decisive)
+
+    def test_a_high_confidence_weak_pool_does_not_become_decisive(self):
+        """The number must not be able to grant what the status withholds.
+
+        fts_fallback carries a floor value (0.5) that is higher than a measured negative
+        cosine (0.38-0.42), so a consumer keying off confidence_score alone reads it as
+        better than it is.  The flag follows the status, not the number.
+        """
+        weak = RoutingDecision(strategy=Strategy.FTS_FALLBACK, confidence_score=0.99,
+                               fast_path_exit=False)
+        self.assertFalse(weak.local_material_decisive)
+
+    def test_a_failed_retriever_does_not_deny_the_corpus(self):
+        """embedding_timeout says the search did not run, not that the corpus is empty.
+
+        Both are false here - nothing may be stated either way - but the distinction is why
+        the status exists at all, so a future change that made the flag true for a degraded
+        request would be caught here rather than in an agent's answer.
+        """
+        degraded = RoutingDecision(strategy=Strategy.EMBEDDING_TIMEOUT, confidence_score=0.0,
+                                   fast_path_exit=False)
+        self.assertFalse(degraded.local_material_decisive)
+
+
 class ShadowProbeTests(unittest.TestCase):
     def test_disabled_target_schedules_nothing(self):
         probe = ShadowProbe(target="off", url="http://127.0.0.1:1")

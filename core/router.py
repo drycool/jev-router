@@ -247,6 +247,25 @@ class RoutingDecision:
     confidence_score: float
     fast_path_exit: bool
 
+    @property
+    def local_material_decisive(self) -> bool:
+        """True only when the local corpus answered the question decisively.
+
+        The eight statuses are precise but they are a taxonomy, and a consumer that has to
+        interpret one is a consumer that can interpret it wrongly - which is the whole
+        history of this branch (a weak pool read as an answer, a broken retriever read as a
+        verdict on the corpus).  This is the one bit that matters for that decision, derived
+        from the strategy rather than set alongside it, so it cannot drift out of step with
+        the status it summarises.
+
+        True for exact_fts and vector_fast: a literal match, or a semantic one that cleared
+        JEV_SIMILARITY_THRESHOLD.  False for everything else, including the two forms of
+        "the local tiers did not decide" (vector_low_confidence, fts_fallback), the two
+        forms of "there was nothing to decide with" (embedding_timeout, general_llm), the
+        parked graph tier, and direct_action - a command is not local material.
+        """
+        return self.strategy in (Strategy.EXACT_FTS, Strategy.VECTOR_FAST)
+
 
 @dataclass
 class ExtractedMetadata:
