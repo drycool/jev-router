@@ -9,6 +9,8 @@ import os
 import hashlib
 import json
 import logging
+import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -93,6 +95,34 @@ FEEDBACK_LOG_PATH = os.getenv(
 )
 VERDICTS = ("accepted", "rejected", "partial")
 FEEDBACK_SOURCES = ("human", "agent", "script")
+
+
+def _running_under_test() -> bool:
+    """True when this process is a test run rather than the service.
+
+    tests/__init__.py already redirects both log paths, but a package initialiser only runs
+    when the suite is imported *as a package*. `python3 -m unittest discover` does that;
+    `python3 -m unittest discover -s tests` imports the test modules as top-level ones and
+    never runs `tests/__init__.py`, so nothing was redirected and the suite appended its
+    fixtures to the production log - two records, 1824 bytes - while the assertion in
+    TestProductionLogsAreProtected reported the damage only after the writes had happened.
+    A canary reports; it does not prevent. The check therefore lives where the write
+    happens, and does not depend on how anyone started the suite.
+    """
+    if "unittest" not in sys.modules:
+        return False
+    return any(name == "tests" or name.startswith("test_") for name in sys.modules)
+
+
+if _running_under_test():
+    _TEST_LOG_DIR = os.path.join(tempfile.gettempdir(), "jev-test-logs")
+    os.makedirs(_TEST_LOG_DIR, exist_ok=True)
+    # Only a path pointing at the production file is redirected: an operator who
+    # deliberately aimed the suite at a copy of the log keeps their copy.
+    if os.path.abspath(DECISION_LOG_PATH) == os.path.join(PROJECT_ROOT, "jev_decisions.jsonl"):
+        DECISION_LOG_PATH = os.path.join(_TEST_LOG_DIR, "decisions.jsonl")
+    if os.path.abspath(FEEDBACK_LOG_PATH) == os.path.join(PROJECT_ROOT, "jev_feedback.jsonl"):
+        FEEDBACK_LOG_PATH = os.path.join(_TEST_LOG_DIR, "feedback.jsonl")
 
 # ── Shadow mode ───────────────────────────────────────────────────────
 # A candidate decision engine probed on real traffic, off the request path.
@@ -540,9 +570,26 @@ _TIER_OF = {
     Strategy.DIRECT_ACTION.value: "tier1",
     Strategy.EXACT_FTS.value: "tier2",
     Strategy.VECTOR_FAST.value: "tier2",
+    # Both fallbacks are served from local rows: the vector tier ran and found only weak
+    # neighbours, or the embedder did not answer and the FTS pool was used.  Neither is
+    # tier3 or tier4, and saying so was the map's default until it was fixed.
+    Strategy.VECTOR_LOW_CONFIDENCE.value: "tier2",
+    Strategy.FTS_FALLBACK.value: "tier2",
     Strategy.GRAPH_LIGHTRAG.value: "tier3",
     Strategy.GENERAL_LLM.value: "tier4",
 }
+
+
+def _tier_of(strategy: Strategy) -> str:
+    """The tier a strategy belongs to, or "unknown" if the map does not know it.
+
+    The default used to be "tier4", so the two local fallbacks were logged as LLM
+    answers.  That is the same defect as one label covering two outcomes, one level up:
+    the telemetry named a tier that had not run, and a wrong tier survives review in a
+    way a missing one does not.  tests/test_ground_truth.py asserts the map is exhaustive,
+    which is what keeps this branch unreachable in practice.
+    """
+    return _TIER_OF.get(strategy.value, "unknown")
 
 
 def _record_decision(
@@ -593,7 +640,7 @@ def _record_decision(
             "context_chunks_used": result.context_stats.get("chunks_used"),
             "context_chunks_duplicate": result.context_stats.get("chunks_duplicate"),
             "context_budget": result.context_stats.get("budget"),
-            "tier": _TIER_OF.get(result.routing_decision.strategy.value, "tier4"),
+            "tier": _tier_of(result.routing_decision.strategy),
             "lightrag_required": result.rag_configuration.lightrag_required,
             "lightrag_mode": result.rag_configuration.lightrag_mode,
             "execute_requested": execute,

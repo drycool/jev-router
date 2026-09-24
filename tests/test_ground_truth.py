@@ -19,6 +19,7 @@ import logging
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import api.server as server
@@ -150,6 +151,8 @@ class TestDecisionRecordShape(unittest.TestCase):
             (Strategy.DIRECT_ACTION, "tier1"),
             (Strategy.EXACT_FTS, "tier2"),
             (Strategy.VECTOR_FAST, "tier2"),
+            (Strategy.VECTOR_LOW_CONFIDENCE, "tier2"),
+            (Strategy.FTS_FALLBACK, "tier2"),
             (Strategy.GRAPH_LIGHTRAG, "tier3"),
             (Strategy.GENERAL_LLM, "tier4"),
         ):
@@ -159,6 +162,24 @@ class TestDecisionRecordShape(unittest.TestCase):
                         "q", make_result(strategy=strategy), 1.0, False, decision_id="d" * 32
                     )
                     self.assertEqual(captured.events()[0]["signals"]["tier"], tier)
+
+    def test_every_strategy_names_its_tier_explicitly(self):
+        """The bug this test exists for.
+
+        The map's default was "tier4", so when the two local fallbacks were added they were
+        logged as LLM answers without a single test noticing: the list above used to be
+        written out by hand, and a hand-written list cannot fail for a strategy that is not
+        in it.  Exhaustive coverage is what makes the default unreachable, so this test
+        enumerates the enum rather than repeating a subset of it.
+        """
+        unmapped = [s.value for s in Strategy if s.value not in server._TIER_OF]
+        self.assertEqual(unmapped, [], f"стратегии без явного яруса: {unmapped}")
+
+    def test_a_strategy_the_map_does_not_know_is_not_reported_as_a_tier(self):
+        """A missing tier must not look like a real one, or the log will be trusted."""
+        invented = SimpleNamespace(value="invented_strategy")
+        # A stub on purpose: the point is a strategy the map has never seen.
+        self.assertEqual(server._tier_of(invented), "unknown")  # type: ignore[arg-type]
 
     def test_preview_is_bounded(self):
         long_answer = "я" * (server.PREVIEW_CHARS * 5)
@@ -382,6 +403,22 @@ class TestProductionLogsAreProtected(unittest.TestCase):
             os.path.abspath(server.FEEDBACK_LOG_PATH),
             os.path.abspath(self.production_feedback_log),
             "the test suite would append to the production feedback log",
+        )
+
+    def test_the_redirect_does_not_depend_on_how_the_suite_was_started(self):
+        """The bypass this mechanism exists for.
+
+        `python3 -m unittest discover -s tests` imports the test modules as top-level ones,
+        so tests/__init__.py never runs and its redirect never happens: the suite appended
+        two fixture records, 1824 bytes, to the production decision log, and the assertion
+        below reported it only after the writes were already on disk. A canary reports; it
+        does not prevent. The server now recognises a test run itself, so the guarantee
+        rests on the write site rather than on the invocation.
+        """
+        self.assertTrue(server._running_under_test())
+        self.assertEqual(
+            os.path.dirname(os.path.abspath(server.DECISION_LOG_PATH)),
+            os.path.join(tempfile.gettempdir(), "jev-test-logs"),
         )
 
     def test_the_handlers_actually_opened_the_redirected_paths(self):
