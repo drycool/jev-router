@@ -23,6 +23,7 @@ from core.router import (
     RAGConfiguration,
     RoutingDecision,
     RoutingResult,
+    SIMILARITY_THRESHOLD,
     Strategy,
     Tier2Search,
     JevRouter,
@@ -316,13 +317,16 @@ class RouterTests(unittest.TestCase):
                     self.assertFalse(result.degraded)
                     router.tier2.close()
 
-    def test_parked_graph_tier_labels_a_vector_served_answer_as_vector(self):
-        """When the embedding does arrive, the vector tier is what answered, so the
-        parked branch has to say so instead of borrowing the graph's name.
+    def test_parked_graph_tier_labels_a_sub_threshold_vector_hit_as_low_confidence(self):
+        """When the embedding arrives but nothing clears the bar, the vector tier
+        offered neighbours and did not decide.  That is a different outcome from
+        the decisive vector_fast exit above, and it has to say so: with one label
+        for both, a 0.31 neighbour and a 0.67 hit read the same to any caller that
+        looks at the status instead of the number.
 
-        The hits are sub-threshold by construction - that is what sends a request
-        down to this branch at all - so the confidence carries the real cosine and
-        makes no claim of a decisive hit."""
+        The hits are sub-threshold by construction here - clearing the threshold
+        would have taken the exit above - so the confidence carries the real
+        cosine and claims nothing."""
         with tempfile.TemporaryDirectory() as directory:
             with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
                 with patch("core.router.LIGHTRAG_ENABLED", False):
@@ -349,11 +353,132 @@ class RouterTests(unittest.TestCase):
 
                     result = asyncio.run(router.route("a query only the parked tier would claim"))
 
-                    self.assertEqual(result.routing_decision.strategy, Strategy.VECTOR_FAST)
+                    self.assertEqual(result.routing_decision.strategy,
+                                     Strategy.VECTOR_LOW_CONFIDENCE)
                     self.assertEqual(result.routing_decision.confidence_score, 0.31)
+                    self.assertLess(result.routing_decision.confidence_score, SIMILARITY_THRESHOLD)
                     self.assertFalse(result.degraded)
                     self.assertEqual(result.extracted_metadata.intent, "vector_search")
                     router.tier2.close()
+
+    def test_weak_vector_neighbours_are_reported_but_not_served(self):
+        """The label describes the tier; the bar still decides the context.
+
+        A neighbour below JEV_SIMILARITY_THRESHOLD is not put in front of the model -
+        the calibrated threshold exists to keep it out - but the request must stop
+        looking identical to one where the vector tier never ran at all.  So it is
+        reported through the status and left out of the context.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                with patch("core.router.LIGHTRAG_ENABLED", False):
+                    router = JevRouter()
+
+                    class Laya:
+                        async def predict_routing(self, _):
+                            return LayaDecision(strategy="general_fallback", status="success")
+
+                    async def embedding(_):
+                        return np.ones(4)
+
+                    router.laya = Laya()
+                    router.get_embedding = embedding
+                    router.tier2.search_vector = lambda *_, **__: [
+                        {"chunk_id": "vec:1", "content": "WEAK-NEIGHBOUR-MARKER",
+                         "source": "/home/dry/memory/projects/x.md", "score": 0.31,
+                         "entity_type": "memory", "search_type": "vector"},
+                    ]
+
+                    # Nothing in FTS either, so the only material in play is the
+                    # weak neighbour - and it must not reach the context.
+                    result = asyncio.run(router.route("qwertyuiop zxcvbnm asdfghjkl"))
+
+                    self.assertEqual(result.routing_decision.strategy,
+                                     Strategy.VECTOR_LOW_CONFIDENCE)
+                    self.assertEqual(result.routing_decision.confidence_score, 0.31)
+                    self.assertEqual(result.context, "")
+                    self.assertNotIn("WEAK-NEIGHBOUR-MARKER", result.context)
+                    router.tier2.close()
+
+    def test_the_vector_search_is_asked_for_unfiltered_neighbours(self):
+        """The threshold moved out of search_vector for a reason: applied inside, it
+        returned an empty list both when the tier found only weak neighbours and when
+        it did not run, so the parked branch could not tell the two apart.  The
+        decisive path must keep the same filtering it always had."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                with patch("core.router.LIGHTRAG_ENABLED", False):
+                    router = JevRouter()
+                    calls = []
+
+                    class Laya:
+                        async def predict_routing(self, _):
+                            return LayaDecision(strategy="general_fallback", status="success")
+
+                    async def embedding(_):
+                        return np.ones(4)
+
+                    def record(*_, **kwargs):
+                        calls.append(kwargs)
+                        return [{"chunk_id": "vec:1", "content": "neighbour",
+                                 "source": "/home/dry/memory/projects/x.md", "score": 0.44,
+                                 "entity_type": "memory", "search_type": "vector"}]
+
+                    router.laya = Laya()
+                    router.get_embedding = embedding
+                    router.tier2.search_vector = record
+
+                    result = asyncio.run(router.route("a query the vector tier cannot answer"))
+
+                    self.assertEqual(calls, [{"domain": "general", "apply_threshold": False}])
+                    # 0.44 is below the code default here, so it stays out of the
+                    # decisive exit and is reported instead.
+                    self.assertEqual(result.routing_decision.strategy,
+                                     Strategy.VECTOR_LOW_CONFIDENCE)
+                    router.tier2.close()
+
+    def test_the_vector_label_follows_the_threshold_on_both_sides(self):
+        """The threshold is the entire difference between the two vector labels, so
+        the boundary is pinned from both sides rather than from one convenient score.
+
+        The threshold is patched here on purpose.  This suite does not load `.env`
+        the way the service does, so unpatched it exercises the code default (0.80)
+        while production runs the calibrated value (0.45) - a test written against
+        one of them stops describing the other without anyone noticing.
+        """
+        def route_with(score: float, threshold: float):
+            with tempfile.TemporaryDirectory() as directory:
+                with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                    with patch("core.router.LIGHTRAG_ENABLED", False):
+                        with patch("core.router.SIMILARITY_THRESHOLD", threshold):
+                            router = JevRouter()
+
+                            class Laya:
+                                async def predict_routing(self, _):
+                                    return LayaDecision(strategy="general_fallback", status="success")
+
+                            async def embedding(_):
+                                return np.ones(4)
+
+                            router.laya = Laya()
+                            router.get_embedding = embedding
+                            router.tier2.search_vector = lambda *_, **__: [
+                                {"chunk_id": "vec:1", "content": "Neighbour",
+                                 "source": "/home/dry/memory/projects/x.md", "score": score,
+                                 "entity_type": "memory", "search_type": "vector"},
+                            ]
+                            result = asyncio.run(router.route("a query the vector tier can answer"))
+                            router.tier2.close()
+                            return result
+
+        above = route_with(0.46, 0.45)
+        self.assertEqual(above.routing_decision.strategy, Strategy.VECTOR_FAST)
+        self.assertEqual(above.routing_decision.confidence_score, 0.46)
+
+        below = route_with(0.44, 0.45)
+        self.assertEqual(below.routing_decision.strategy, Strategy.VECTOR_LOW_CONFIDENCE)
+        self.assertEqual(below.routing_decision.confidence_score, 0.44)
+        self.assertFalse(below.degraded)
 
     def test_vector_index_is_read_once_not_per_request(self):
         """Loading the archive on every request cost ~310 ms of blocked event loop while

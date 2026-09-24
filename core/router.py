@@ -184,6 +184,13 @@ class Strategy(str, Enum):
     # were found, nothing matched decisively, and any number above the floor would
     # claim a relevance the gate declined.
     FTS_FALLBACK = "fts_fallback"
+    # Vector neighbours that all scored below JEV_SIMILARITY_THRESHOLD.  The tier
+    # ran and returned neighbours, but none cleared the bar, so this is not the
+    # decisive hit vector_fast names - and the asymmetry would be worse than the
+    # gate's: a 0.31 neighbour and a 0.67 hit would wear the same label while only
+    # the number told them apart.  Confidence carries the real cosine, which is
+    # below the threshold by construction.
+    VECTOR_LOW_CONFIDENCE = "vector_low_confidence"
 
 
 class AgentType(str, Enum):
@@ -717,8 +724,16 @@ class Tier2Search:
             })
         return results
 
-    def search_vector(self, query: str, query_embedding: np.ndarray, limit: Optional[int] = None, domain: str = "general") -> list[dict]:
-        """Vector cosine similarity search. ~10-30ms. Same pool depth as the FTS path."""
+    def search_vector(self, query: str, query_embedding: np.ndarray, limit: Optional[int] = None, domain: str = "general", apply_threshold: bool = True) -> list[dict]:
+        """Vector cosine similarity search. ~10-30ms. Same pool depth as the FTS path.
+
+        ``apply_threshold`` drops the neighbours that score below
+        ``SIMILARITY_THRESHOLD``, which is what the decisive exit wants.  Callers
+        that need to *report* on the tier rather than act on it pass ``False``: the
+        threshold filter used to be unconditional, so a request whose neighbours all
+        fell short saw an empty list and could not tell "the tier ran and found only
+        weak neighbours" from "the tier did not run at all"."""
+
         if limit is None:
             limit = RETRIEVAL_LIMIT
         t0 = time.perf_counter()
@@ -769,7 +784,7 @@ class Tier2Search:
         results = []
         for idx in top_indices:
             score = float(scores[idx])
-            if score < SIMILARITY_THRESHOLD:
+            if apply_threshold and score < SIMILARITY_THRESHOLD:
                 continue
             results.append({
                 "chunk_id": str(chunk_ids[idx]),
@@ -992,7 +1007,21 @@ class JevRouter:
         # parked, and its 30 s client timeout is the worst case it can cost: a
         # rebooting GPU2 was observed stalling a request for ~16 s.
         query_embedding = await self.get_embedding(query) if Path(VECTOR_DB_PATH).exists() else None
-        vector_results = self.tier2.search_vector(query, query_embedding, domain=domain) if query_embedding is not None else []
+        # One search, with the threshold applied out here instead of inside it.  The
+        # decisive exit below needs the neighbours that cleared the bar; the parked
+        # branch needs to know whether the tier found *anything*, because "ran and
+        # found only weak neighbours" and "did not run" are different states and used
+        # to look identical (an empty list) from here.
+        if query_embedding is not None:
+            neighbours = self.tier2.search_vector(
+                query, query_embedding, domain=domain, apply_threshold=False)
+        else:
+            neighbours = []
+        vector_results = [
+            item for item in neighbours if item["score"] >= SIMILARITY_THRESHOLD]
+        # The best neighbour regardless of the bar: this is the only number that can
+        # describe a tier which ran and did not clear it.
+        best_neighbour_score = neighbours[0]["score"] if neighbours else 0.0
         tier2_results = fts_results + [
             item for item in vector_results
             if item["chunk_id"] not in {fts["chunk_id"] for fts in fts_results}
@@ -1085,23 +1114,30 @@ class JevRouter:
             if context_results:
                 context, context_stats = assemble_context(context_results)
 
-            # Name the tier that answered, and say plainly when nothing did.  Three
+            # Name the tier that answered, and say plainly when nothing did.  Four
             # outcomes live here, and running them together under one label is what
             # this branch got wrong twice: first as graph_lightrag (an outage that
             # never happened), then as exact_fts 0.7 (a decisive-hit label on a pool
             # the gate had just refused).  A caller that cannot tell a weak pool from
             # an answer reads the weak pool as the answer.
             #
-            #   vector hits arrived   -> vector_fast, with the real cosine
-            #   local rows, no gate   -> fts_fallback, floor confidence
-            #   nothing local at all  -> general_llm, no context
+            #   neighbours, none clearing -> vector_low_confidence, best real cosine
+            #   local rows, no gate       -> fts_fallback, floor confidence
+            #   nothing local at all      -> general_llm, no context
             #
-            # The third case is not a fallback to FTS - there is no FTS row behind
+            # Reaching this branch at all means the decisive exits above were not
+            # taken, so any neighbour here is below JEV_SIMILARITY_THRESHOLD: the same
+            # label as a hit that cleared the bar would hide the only difference there
+            # is.  The neighbours are *reported*, not served - the calibrated bar
+            # exists to keep them out of the context, and the local rows keep their
+            # place in it.
+            #
+            # The last case is not a fallback to FTS - there is no FTS row behind
             # it - so it is not labelled as one.  It is the only case where the
             # model has to answer by itself, and saying so is the point.
-            if vector_results:
-                strategy = Strategy.VECTOR_FAST
-                confidence = best_score
+            if neighbours:
+                strategy = Strategy.VECTOR_LOW_CONFIDENCE
+                confidence = best_neighbour_score
                 intent = "vector_search"
             elif context_results:
                 strategy = Strategy.FTS_FALLBACK
