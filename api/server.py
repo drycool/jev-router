@@ -575,6 +575,9 @@ _TIER_OF = {
     # tier3 or tier4, and saying so was the map's default until it was fixed.
     Strategy.VECTOR_LOW_CONFIDENCE.value: "tier2",
     Strategy.FTS_FALLBACK.value: "tier2",
+    # Degraded, but still tier2: the answer is local rows.  The distinction the caller
+    # needs is in execution.degraded and fallback_reason, not in which tier ran.
+    Strategy.EMBEDDING_TIMEOUT.value: "tier2",
     Strategy.GRAPH_LIGHTRAG.value: "tier3",
     Strategy.GENERAL_LLM.value: "tier4",
 }

@@ -254,7 +254,14 @@ class RouterTests(unittest.TestCase):
         It used to report graph_lightrag with degraded=true, which announced an
         outage that never happened - the call is skipped, elapsed_ms 0.0 - and hid
         which tier produced the context. A parked tier is a configuration, not a
-        failure, so it must not be reported as one."""
+        failure, so it must not be reported as one.
+
+        The embedder here answers and the vector index offers nothing, which is what
+        this test was always trying to say: it used to stub the embedder out instead,
+        because that was the only way to empty the neighbour list - and that made the
+        test pass for a reason it did not claim.  An embedder that does not answer is
+        now its own reported state, so the weaker stub would no longer mean "no
+        neighbours", it would mean "the semantic search never ran"."""
         with tempfile.TemporaryDirectory() as directory:
             with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
                 with patch("core.router.LIGHTRAG_ENABLED", False):
@@ -269,12 +276,18 @@ class RouterTests(unittest.TestCase):
                         async def predict_routing(self, _):
                             return LayaDecision(strategy="general_fallback", status="success")
 
-                    async def no_embedding(_):
-                        return None
+                    async def embedding(_):
+                        return np.ones(4)
+
+                    def empty_index(*_, **__):
+                        # search_vector is synchronous; an async stub here would hand
+                        # route() a coroutine and the neighbour list would be one.
+                        return []
 
                     router.tier3.search = must_not_run
                     router.laya = Laya()
-                    router.get_embedding = no_embedding
+                    router.get_embedding = embedding
+                    router.tier2.search_vector = empty_index
 
                     started = time.perf_counter()
                     result = asyncio.run(router.route("torque of the cylinder head bolts"))
@@ -303,11 +316,15 @@ class RouterTests(unittest.TestCase):
                         async def predict_routing(self, _):
                             return LayaDecision(strategy="general_fallback", status="success")
 
-                    async def no_embedding(_):
-                        return None
+                    async def embedding(_):
+                        return np.ones(4)
+
+                    def empty_index(*_, **__):
+                        return []
 
                     router.laya = Laya()
-                    router.get_embedding = no_embedding
+                    router.get_embedding = embedding
+                    router.tier2.search_vector = empty_index
 
                     result = asyncio.run(router.route("qwertyuiop zxcvbnm asdfghjkl"))
 
@@ -316,6 +333,83 @@ class RouterTests(unittest.TestCase):
                     self.assertEqual(result.context, "")
                     self.assertFalse(result.degraded)
                     router.tier2.close()
+
+    def test_a_silent_embedder_is_reported_as_a_degradation_not_as_a_weak_pool(self):
+        """The difference between "the corpus matched nothing relevant" and "the
+        semantic search never happened".
+
+        Both used to arrive as fts_fallback, with the same floor confidence and
+        degraded=false, so the only thing telling them apart was latency - 83-149 ms with
+        the embedder answering, 2049-2128 ms with it evicted to the CPU - and no consumer
+        reads latency. A caller that takes a broken retriever's silence for a verdict on
+        its corpus draws the wrong conclusion about the material and retries the wrong
+        thing.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                with patch("core.router.LIGHTRAG_ENABLED", False):
+                    router = JevRouter()
+                    router.tier2.index_chunk("one", "Torque settings for various fasteners")
+                    router.tier2.commit()
+
+                    class Laya:
+                        async def predict_routing(self, _):
+                            return LayaDecision(strategy="general_fallback", status="success")
+
+                    async def no_embedding(_):
+                        return None
+
+                    router.laya = Laya()
+                    router.get_embedding = no_embedding
+
+                    result = asyncio.run(router.route("torque of the cylinder head bolts"))
+
+                    self.assertEqual(result.routing_decision.strategy,
+                                     Strategy.EMBEDDING_TIMEOUT)
+                    self.assertEqual(result.routing_decision.confidence_score, 0.0)
+                    self.assertTrue(result.degraded)
+                    self.assertEqual(result.fallback_reason, "embedding_timeout")
+                    # The status is the verdict; the local rows are still what gets served.
+                    self.assertIn("Torque settings", result.context)
+                    router.tier2.close()
+
+    def test_a_missing_vector_index_is_not_reported_as_an_embedder_failure(self):
+        """No index to search and an embedder that will not answer are different states.
+
+        The second is an outage to report; the first is a configuration to fix, and
+        calling it degraded would send an operator to GPU2 over a file path. So the
+        degraded status is gated on the embedder having been asked at all - and this
+        asserts the asking, not just the resulting label, because "we did not try" and
+        "we tried and failed" are the two states being separated.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                with patch("core.router.LIGHTRAG_ENABLED", False):
+                    with patch("core.router.VECTOR_DB_PATH",
+                               str(Path(directory) / "absent.npz")):
+                        router = JevRouter()
+                        router.tier2.index_chunk("one", "Torque settings for various fasteners")
+                        router.tier2.commit()
+
+                        class Laya:
+                            async def predict_routing(self, _):
+                                return LayaDecision(strategy="general_fallback",
+                                                    status="success")
+
+                        async def must_not_be_asked(_):
+                            raise AssertionError(
+                                "the embedder must not be called with no index to search")
+
+                        router.laya = Laya()
+                        router.get_embedding = must_not_be_asked
+
+                        result = asyncio.run(router.route("torque of the cylinder head bolts"))
+
+                        self.assertEqual(result.routing_decision.strategy,
+                                         Strategy.FTS_FALLBACK)
+                        self.assertFalse(result.degraded)
+                        self.assertIsNone(result.fallback_reason)
+                        router.tier2.close()
 
     def test_parked_graph_tier_labels_a_sub_threshold_vector_hit_as_low_confidence(self):
         """When the embedding arrives but nothing clears the bar, the vector tier

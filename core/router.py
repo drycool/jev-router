@@ -191,6 +191,19 @@ class Strategy(str, Enum):
     # the number told them apart.  Confidence carries the real cosine, which is
     # below the threshold by construction.
     VECTOR_LOW_CONFIDENCE = "vector_low_confidence"
+    # The embedder did not answer, so the vector tier never ran this request.  This is
+    # the one state in this branch that is a degradation rather than a retrieval
+    # outcome, and it used to be indistinguishable from a weak pool: both arrived as
+    # fts_fallback with degraded=false, and the only difference was latency (83-149 ms
+    # when the embedder answered, 2049-2128 ms when it had been evicted to the CPU) -
+    # which no consumer reads.  A caller told "the corpus matched nothing relevant"
+    # when the truth is "the semantic search never happened" will trust the wrong
+    # conclusion, so the two are separated here and this one is marked degraded.
+    #
+    # Fires only when the embedder was actually asked.  A missing or empty vector
+    # index is a configuration to fix, not an outage to report, and it is not folded
+    # in here - see the embedder_attempted flag in route().
+    EMBEDDING_TIMEOUT = "embedding_timeout"
 
 
 class AgentType(str, Enum):
@@ -1006,7 +1019,17 @@ class JevRouter:
         # remaining GPU dependency on the fall-through path once the graph tier is
         # parked, and its 30 s client timeout is the worst case it can cost: a
         # rebooting GPU2 was observed stalling a request for ~16 s.
-        query_embedding = await self.get_embedding(query) if Path(VECTOR_DB_PATH).exists() else None
+        # Two reasons leave query_embedding None, and they are not the same state: the
+        # embedder was asked and did not answer in budget (a degradation to report), or
+        # there is no vector index to search (a configuration to fix).  Only the first
+        # is an outage, so the flag below gates the degraded status on it - the second
+        # keeps reporting whatever the local tiers actually did.  Measured on the live
+        # host: the embedder had been evicted to the CPU by two other models sharing the
+        # 12 GB card and cost 17.2 s against a 2.0 s budget, so every non-literal query
+        # landed here and was reported as fts_fallback with degraded=false.
+        vector_index_present = Path(VECTOR_DB_PATH).exists()
+        query_embedding = await self.get_embedding(query) if vector_index_present else None
+        embedder_failed = vector_index_present and query_embedding is None
         # One search, with the threshold applied out here instead of inside it.  The
         # decisive exit below needs the neighbours that cleared the bar; the parked
         # branch needs to know whether the tier found *anything*, because "ran and
@@ -1114,16 +1137,26 @@ class JevRouter:
             if context_results:
                 context, context_stats = assemble_context(context_results)
 
-            # Name the tier that answered, and say plainly when nothing did.  Four
+            # Name the tier that answered, and say plainly when nothing did.  Five
             # outcomes live here, and running them together under one label is what
-            # this branch got wrong twice: first as graph_lightrag (an outage that
-            # never happened), then as exact_fts 0.7 (a decisive-hit label on a pool
-            # the gate had just refused).  A caller that cannot tell a weak pool from
-            # an answer reads the weak pool as the answer.
+            # this branch got wrong three times: first as graph_lightrag (an outage
+            # that never happened), then as exact_fts 0.7 (a decisive-hit label on a
+            # pool the gate had just refused), then as fts_fallback for a request whose
+            # semantic search had not run at all.  A caller that cannot tell a weak
+            # pool from an answer reads the weak pool as the answer; a caller that
+            # cannot tell a weak pool from a broken retriever retries the wrong thing.
             #
-            #   neighbours, none clearing -> vector_low_confidence, best real cosine
-            #   local rows, no gate       -> fts_fallback, floor confidence
-            #   nothing local at all      -> general_llm, no context
+            #   embedder silent            -> embedding_timeout, degraded
+            #   neighbours, none clearing  -> vector_low_confidence, best real cosine
+            #   local rows, no gate        -> fts_fallback, floor confidence
+            #   nothing local at all       -> general_llm, no context
+            #
+            # The embedder check comes first because it describes why the branch was
+            # reached rather than what it served: when it fires, no vector search
+            # happened, so no retrieval conclusion can be drawn from the tier at all -
+            # including "the corpus matched nothing relevant", which is what
+            # fts_fallback would have said.  The context is still local rows, and the
+            # consumer is expected to read this status, not the context, as the verdict.
             #
             # Reaching this branch at all means the decisive exits above were not
             # taken, so any neighbour here is below JEV_SIMILARITY_THRESHOLD: the same
@@ -1135,7 +1168,15 @@ class JevRouter:
             # The last case is not a fallback to FTS - there is no FTS row behind
             # it - so it is not labelled as one.  It is the only case where the
             # model has to answer by itself, and saying so is the point.
-            if neighbours:
+            degraded = False
+            fallback_reason = None
+            if embedder_failed:
+                strategy = Strategy.EMBEDDING_TIMEOUT
+                confidence = 0.0
+                intent = "vector_search"
+                degraded = True
+                fallback_reason = "embedding_timeout"
+            elif neighbours:
                 strategy = Strategy.VECTOR_LOW_CONFIDENCE
                 confidence = best_neighbour_score
                 intent = "vector_search"
@@ -1168,7 +1209,8 @@ class JevRouter:
                 query=query,
                 context=context,
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
-                degraded=False,
+                degraded=degraded,
+                fallback_reason=fallback_reason,
                 laya_result=laya_data,
                 context_stats=context_stats,
             )
