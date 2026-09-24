@@ -1038,15 +1038,63 @@ class JevRouter:
             )
 
         # ── Tier 3: LightRAG Graph Search ──
-        # Determine mode based on query characteristics
         lightrag_mode = self._determine_lightrag_mode(query)
 
-        if LIGHTRAG_ENABLED:
-            tier3_result = await self.tier3.search(query, mode=lightrag_mode)
-        else:
-            # Parked, not broken: no call is made, and the degraded branch below
-            # serves the same local retrieval a timeout would have served.
-            tier3_result = {"response": "", "error_type": "disabled", "elapsed_ms": 0.0}
+        if not LIGHTRAG_ENABLED:
+            # Parked by configuration, so there is no outage to report.  Naming
+            # this result graph_lightrag with degraded=true described a failure
+            # that did not happen and hid which tier actually served the request:
+            # the graph call is skipped entirely (elapsed_ms 0.0), so the context
+            # can only have come from the local tiers above.  Measured on a query
+            # the parked tier would have claimed: 2.2 s, degraded=true, while the
+            # material served was plain local retrieval.
+            #
+            # The tier that did the work names the result instead.  Sub-threshold
+            # vector hits stay in play because the graph tier that would have
+            # covered them is off by configuration, and dropping them would serve
+            # strictly less than the parked branch served before.  Confidence is
+            # left at this branch's historical 0.7 rather than the decisive 0.95
+            # of the early exit: the gate declined that exit, so this result does
+            # not claim a decisive local hit.
+            context = ""
+            context_stats: dict = {}
+            context_results = vector_results
+            if raw_held_back:
+                seen = {item["chunk_id"] for item in vector_results}
+                context_results = vector_results + [
+                    item for item in raw_held_back if item["chunk_id"] not in seen]
+            if not context_results:
+                context_results = tier2_results
+            if context_results:
+                context, context_stats = assemble_context(context_results)
+            served_by_vector = bool(vector_results)
+
+            return RoutingResult(
+                routing_decision=RoutingDecision(
+                    strategy=Strategy.VECTOR_FAST if served_by_vector else Strategy.EXACT_FTS,
+                    confidence_score=best_score if served_by_vector else 0.7,
+                    fast_path_exit=False,
+                ),
+                extracted_metadata=ExtractedMetadata(
+                    intent="vector_search" if served_by_vector else "exact_search",
+                    keywords=_extract_keywords(query),
+                    entities=self._extract_entities(query),
+                    domain=domain,
+                ),
+                rag_configuration=RAGConfiguration(
+                    lightrag_required=False,
+                    lightrag_mode="skip",
+                ),
+                target_agent=target_agent,
+                query=query,
+                context=context,
+                elapsed_ms=(time.perf_counter() - t0) * 1000,
+                degraded=False,
+                laya_result=laya_data,
+                context_stats=context_stats,
+            )
+
+        tier3_result = await self.tier3.search(query, mode=lightrag_mode)
 
         # The graph tier composes its own context, so neither the dedup nor the budget is
         # applied here: assemble_context works on ranked chunks, and rewriting a

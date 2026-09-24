@@ -247,8 +247,13 @@ class RouterTests(unittest.TestCase):
     def test_disabled_graph_tier_serves_the_local_answer_without_waiting(self):
         """The graph tier is parked on this hardware: retrieval alone measured 10.9 s
         against a 5 s budget, so calling it is a guaranteed timeout that pays for
-        nothing. Disabling it must skip the call and still return the same context
-        the timeout path served - same answer, none of the wait."""
+        nothing. Disabling it must skip the call, serve the local retrieval, and name
+        the tier that actually answered.
+
+        It used to report graph_lightrag with degraded=true, which announced an
+        outage that never happened - the call is skipped, elapsed_ms 0.0 - and hid
+        which tier produced the context. A parked tier is a configuration, not a
+        failure, so it must not be reported as one."""
         with tempfile.TemporaryDirectory() as directory:
             with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
                 with patch("core.router.LIGHTRAG_ENABLED", False):
@@ -274,12 +279,51 @@ class RouterTests(unittest.TestCase):
                     result = asyncio.run(router.route("torque of the cylinder head bolts"))
                     elapsed = time.perf_counter() - started
 
-                    self.assertEqual(result.routing_decision.strategy, Strategy.GRAPH_LIGHTRAG)
-                    self.assertTrue(result.degraded)
-                    self.assertEqual(result.fallback_reason, "lightrag_disabled")
+                    self.assertEqual(result.routing_decision.strategy, Strategy.EXACT_FTS)
+                    self.assertFalse(result.degraded)
+                    self.assertIsNone(result.fallback_reason)
                     self.assertIn("Torque settings", result.context)
                     self.assertFalse(result.rag_configuration.lightrag_required)
                     self.assertLess(elapsed, 0.5)
+                    router.tier2.close()
+
+    def test_parked_graph_tier_labels_a_vector_served_answer_as_vector(self):
+        """When the embedding does arrive, the vector tier is what answered, so the
+        parked branch has to say so instead of borrowing the graph's name.
+
+        The hits are sub-threshold by construction - that is what sends a request
+        down to this branch at all - so the confidence carries the real cosine and
+        makes no claim of a decisive hit."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("core.router.FTS5_DB_PATH", str(Path(directory) / "index.db")):
+                with patch("core.router.LIGHTRAG_ENABLED", False):
+                    router = JevRouter()
+
+                    async def must_not_run(*_, **__):
+                        raise AssertionError("the graph tier must not be called when parked")
+
+                    class Laya:
+                        async def predict_routing(self, _):
+                            return LayaDecision(strategy="graph_lightrag", status="success")
+
+                    async def embedding(_):
+                        return np.ones(4)
+
+                    router.tier3.search = must_not_run
+                    router.laya = Laya()
+                    router.get_embedding = embedding
+                    router.tier2.search_vector = lambda *_, **__: [
+                        {"chunk_id": "vec:1", "content": "Sub-threshold neighbour",
+                         "source": "/home/dry/memory/projects/x.md", "score": 0.31,
+                         "entity_type": "memory", "search_type": "vector"},
+                    ]
+
+                    result = asyncio.run(router.route("a query only the parked tier would claim"))
+
+                    self.assertEqual(result.routing_decision.strategy, Strategy.VECTOR_FAST)
+                    self.assertEqual(result.routing_decision.confidence_score, 0.31)
+                    self.assertFalse(result.degraded)
+                    self.assertEqual(result.extracted_metadata.intent, "vector_search")
                     router.tier2.close()
 
     def test_vector_index_is_read_once_not_per_request(self):

@@ -45,6 +45,15 @@ CONTROL_QUERIES: list[tuple[str, str]] = [
     ("Как устроена двухслойная конфигурация garageOS и чёрный ящик инцидентов", "garageos.md"),
     ("Кабели для Raspberry Pi 5", "Gemini"),
     ("затяжка болтов головки блока цилиндров момент", "d_espero.pdf"),
+    # No document describes the router's own request flow, and the finding that
+    # records this is exactly the kind of note that can invent one: writing the
+    # question's own words into the corpus would make the note answer the question
+    # it says is unanswerable.  Empty expectation = nobody may take the gate.
+    ("как идут запросы и есть ли промежуточные сервисы", ""),
+    # This one *is* answerable - the board material is the right source - so the
+    # expectation names it and the guard only fires on a third document trying to
+    # take the gate away from it.
+    ("UPS HAT и Orange PI4 Pro возможно взаимодействие?", "carpc"),
     ("Какая погода в Киеве завтра", ""),
     ("Купить билеты на поезд Киев Львов", ""),
 ]
