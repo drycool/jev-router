@@ -37,6 +37,7 @@ from core.memory_index import (
     ENTITY_TYPE_CORPUS,
     MEMORY_CHUNK_PREFIX,
     build_chunks,
+    feed,
     index_corpus,
     index_memory,
 )
@@ -353,14 +354,20 @@ class WiringTests(unittest.TestCase):
     def _source(self, relative: str) -> str:
         return (Path(__file__).resolve().parents[1] / relative).read_text(encoding="utf-8")
 
-    def test_the_server_indexes_the_corpus_after_the_lightrag_rebuild(self):
+    def test_the_server_indexes_the_feeds_after_the_lightrag_rebuild(self):
         source = self._source("api/server.py")
         lightrag_call = source.index("await _index_lightrag_chunks()")
-        corpus_call = source.index("await _index_corpus_docs()")
-        self.assertLess(lightrag_call, corpus_call,
-                        "the LightRAG rebuild starts with clear(); indexing the corpus "
+        feeds_call = source.index("await _index_feeds()")
+        self.assertLess(lightrag_call, feeds_call,
+                        "the LightRAG rebuild starts with clear(); indexing a feed "
                         "before it would delete the imported rows on every start")
-        self.assertIn("async def _index_corpus_docs():", source)
+
+    def test_the_chat_corpus_is_a_registered_feed(self):
+        """The import only counts if the directory the importer writes is the one
+        the indexer reads, under its own id namespace."""
+        self.assertEqual(feed("chats").directory, str(DEFAULT_OUT))
+        self.assertEqual(feed("chats").prefix, CORPUS_CHUNK_PREFIX)
+        self.assertEqual(feed("chats").entity_type, ENTITY_TYPE_CORPUS)
 
     def test_a_full_vector_rebuild_merges_the_imported_corpus(self):
         """Otherwise the next rebuild drops the import: the archive would look

@@ -23,6 +23,7 @@ from core.memory_index import (
     DEFAULT_MAX_CHARS,
     ENTITY_TYPE,
     build_chunks,
+    feeds,
     index_memory,
 )
 from core.router import Tier2Search
@@ -191,20 +192,26 @@ class ServerWiringTests(unittest.TestCase):
     def _source(self) -> str:
         return (Path(__file__).resolve().parents[1] / "api" / "server.py").read_text(encoding="utf-8")
 
-    def test_the_server_indexes_memory_after_the_lightrag_rebuild(self):
+    def test_the_server_indexes_the_feeds_after_the_lightrag_rebuild(self):
         source = self._source()
         lightrag_call = source.index("await _index_lightrag_chunks()")
-        memory_call = source.index("await _index_memory_docs()")
+        feeds_call = source.index("await _index_feeds()")
         self.assertLess(
-            lightrag_call, memory_call,
-            "the LightRAG rebuild starts with clear(); indexing memory before it "
-            "would delete the memory rows on every start",
+            lightrag_call, feeds_call,
+            "the LightRAG rebuild starts with clear(); indexing the feeds before it "
+            "would delete their rows on every start",
         )
 
-    def test_the_server_has_the_function_it_calls(self):
+    def test_the_server_indexes_every_registered_feed(self):
+        """One code path, driven by the registry: a feed that exists but is not in
+        the registry is a directory of files nobody can search."""
         source = self._source()
-        self.assertIn("async def _index_memory_docs():", source)
+        self.assertIn("async def _index_feeds():", source)
+        self.assertIn("for spec in feeds():", source)
+        self.assertIn("index_feed(router.tier2.conn", source)
         self.assertIn("from core.memory_index import", source)
+        names = [spec.name for spec in feeds()]
+        self.assertIn("memory", names, "the memory documents must be one of the feeds")
 
     def test_the_embedder_is_warmed_without_being_awaited(self):
         """The warm-up has to happen, and has to happen off the request path.
@@ -214,9 +221,9 @@ class ServerWiringTests(unittest.TestCase):
         would hold the port closed while the health check reports nothing.
         """
         source = self._source()
-        memory_call = source.index("await _index_memory_docs()")
+        feeds_call = source.index("await _index_feeds()")
         warm_call = source.index("asyncio.create_task(_warm_embedder())")
-        self.assertLess(memory_call, warm_call)
+        self.assertLess(feeds_call, warm_call)
         self.assertNotIn("await _warm_embedder()", source,
                          "the warm-up must not be awaited in the lifespan")
 

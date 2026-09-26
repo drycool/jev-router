@@ -16,9 +16,9 @@ blocks), because that is the shape the corpus chunker already knows how to split
 into self-describing chunks.
 
 The output directory is indexed at server start by the same code path that
-indexes the memory directory (`_index_corpus_docs`), so an import survives a
-restart.  Writing rows straight into the derived FTS5 table would not: it is
-rebuilt from scratch on every start.
+indexes every other feed (`api/server.py::_index_feeds`, feed "chats"), so an
+import survives a restart.  Writing rows straight into the derived FTS5 table
+would not: it is rebuilt from scratch on every start.
 
     python3 scripts/import_chat_export.py --list
     python3 scripts/import_chat_export.py --match x728,geekworm --dry-run
@@ -247,7 +247,8 @@ def main() -> int:
         print(f"[import] dry run: {len(selected)} conversations would be written to {args.out}")
     else:
         print(f"[import] {written} conversations written to {args.out}; "
-              f"start jev.service (or run scripts/index_corpus.py) to make them searchable")
+              f"start jev.service (or run scripts/index_feeds.py --feed chats) "
+              f"to make them searchable")
     return 0
 
 

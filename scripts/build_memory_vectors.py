@@ -47,31 +47,62 @@ from core.env import load_env  # noqa: E402
 # the two can differ (JEV_EMBEDDING_API points at the CPU instance here).
 load_env()
 
-from core.memory_index import CORPUS_CHUNK_PREFIX, MEMORY_CHUNK_PREFIX  # noqa: E402
+from core.memory_index import ENTITY_TYPE, feed, feeds  # noqa: E402
 from core.router import detect_domain  # noqa: E402
 from core.vector_index import (  # noqa: E402
     VectorIndexError,
     corpus_rows,
-    corpus_rows_from_fts5,
     embed_texts,
     load_index,
     memory_rows_from_fts5,
-    merge_corpus,
-    merge_memory,
+    merge_namespace,
     prune_excluded,
+    rows_from_fts5,
     save_index,
 )
 
 DEFAULT_INDEX = PROJECT_ROOT / "storage" / "jev_vectors.npz"
 DEFAULT_DB = PROJECT_ROOT / "storage" / "jev_fts5.db"
 
-# namespace -> (reader of the FTS5 rows, merge into the archive, chunk-id prefix)
-NAMESPACES = {
-    "memory": (memory_rows_from_fts5, merge_memory, MEMORY_CHUNK_PREFIX),
-    "corpus": (corpus_rows_from_fts5, merge_corpus, CORPUS_CHUNK_PREFIX),
-}
-# (namespace, chunks, merge function, chunk-id prefix)
+# (namespace, a reader of that feed's FTS5 rows, a merge into the archive, its prefix)
+NamespaceSpec = tuple[str, Callable[..., list[tuple[str, str, str]]],
+                      Callable[..., tuple[dict, dict]], str]
+# (namespace, the rows read, the merge, the prefix) - what a run works from
 RowPlan = tuple[str, list[tuple[str, str, str]], Callable[..., tuple[dict, dict]], str]
+
+
+def _merger(spec) -> Callable[..., tuple[dict, dict]]:
+    """A merge for one feed, closing over its id namespace.
+
+    The prefix comes from the registry rather than from the caller, so a run
+    cannot replace one feed's vectors with another's content - a prefix that
+    matches nothing replaces nothing, which is a silent no-op instead of a silent
+    corruption.
+    """
+
+    def merge(index, chunks, embeddings, domains=None):
+        merged, replaced = merge_namespace(index, chunks, embeddings, domains,
+                                           spec.prefix, spec.entity_type)
+        return merged, {
+            "replaced": replaced,
+            "added": len(chunks),
+            "total": len(merged["chunk_ids"]),
+        }
+
+    return merge
+
+
+def namespace_plan(name: str) -> NamespaceSpec:
+    """How one registered feed is read out of FTS5 and merged into the archive."""
+    spec = feed(name)
+    reader: Callable[..., list[tuple[str, str, str]]]
+    if spec.name == "memory":
+        # Memory rows are identified by their tag in FTS5, which is what the
+        # indexer writes and what the merge has always used.
+        reader = memory_rows_from_fts5
+    else:
+        reader = lambda db: rows_from_fts5(db, spec.prefix)
+    return (spec.name, reader, _merger(spec), spec.prefix)
 
 
 def report_changes(index: dict, chunks: list[tuple[str, str, str]], prefix: str) -> int:
@@ -95,17 +126,19 @@ def report_changes(index: dict, chunks: list[tuple[str, str, str]], prefix: str)
 
 
 def selected_namespaces(args: argparse.Namespace) -> list[str]:
-    return ["memory", "corpus"] if args.namespace == "both" else [args.namespace]
+    if args.namespace == "all":
+        return [spec.name for spec in feeds()]
+    return [args.namespace]
 
 
 def read_rows(args: argparse.Namespace, names: list[str]) -> list[RowPlan]:
-    """One entry per namespace with rows to write: (name, chunks, merge, prefix)."""
+    """One entry per feed with rows to write: (name, chunks, merge, prefix)."""
     plan = []
     for name in names:
-        reader, merge, prefix = NAMESPACES[name]
+        namespace, reader, merge, prefix = namespace_plan(name)
         chunks = reader(args.db) if args.db.exists() else []
-        print(f"{name:<7}: {len(chunks)} chunks in FTS5")
-        plan.append((name, chunks, merge, prefix))
+        print(f"{namespace:<9}: {len(chunks)} chunks in FTS5")
+        plan.append((namespace, chunks, merge, prefix))
     return plan
 
 
@@ -179,8 +212,9 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--index", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
-    parser.add_argument("--namespace", choices=["memory", "corpus", "both"], default="memory",
-                        help="which FTS5 namespace to refresh (default memory)")
+    parser.add_argument("--namespace", choices=[spec.name for spec in feeds()] + ["all"],
+                        default="memory",
+                        help="which feed's vectors to refresh (default memory; 'all' for every feed)")
     parser.add_argument("--api", default=os.getenv("JEV_EMBEDDING_API",
                                                    "http://192.168.11.87:11434/api/embed"))
     parser.add_argument("--model", default=os.getenv("JEV_EMBEDDING_MODEL", "bge-m3"))

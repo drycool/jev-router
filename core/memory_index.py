@@ -33,21 +33,77 @@ import os
 import re
 import sqlite3
 from pathlib import Path
+from typing import NamedTuple
 
 # Read once at import, like the router's own settings; the indexers accept an
 # explicit root so callers (and tests) are never forced to touch the env.
-MEMORY_DIR = os.getenv("JEV_MEMORY_DIR", "/home/dry/memory")
+DEFAULT_MEMORY_DIR = "/home/dry/memory"
+MEMORY_DIR = os.getenv("JEV_MEMORY_DIR", DEFAULT_MEMORY_DIR)
 # An answer that lives only in an export is not findable, and the discussion
 # about a UPS HAT existed only in the export: 351 conversations, one of them in
 # the corpus.  This directory is what the importer writes and the server indexes.
-CORPUS_DIR = os.getenv("JEV_CORPUS_DIR", "/home/dry/LightRag/gemini_chats")
+DEFAULT_CHATS_DIR = "/home/dry/LightRag/feeds/chats"
+CORPUS_DIR = os.getenv("JEV_CORPUS_DIR", DEFAULT_CHATS_DIR)
+# Written by `jev-collect` (Go): the documentation and commit history of the
+# repositories on this machine, and later GitHub and the agent's own sessions.
+DEFAULT_PROJECTS_DIR = "/home/dry/LightRag/feeds/projects"
 ENTITY_TYPE = "memory"
 ENTITY_TYPE_CORPUS = ""
 MEMORY_CHUNK_PREFIX = "mem:"
 CORPUS_CHUNK_PREFIX = "gem:"
+PROJECT_CHUNK_PREFIX = "prj:"
 # The server indexes LightRAG chunks at 2000 characters; staying under that keeps
 # one document from being penalised relative to another by the BM25 length norm.
 DEFAULT_MAX_CHARS = 1800
+
+# Every directory the service indexes, in one place.  A feed is (name, env var,
+# default directory, chunk-id namespace, row tag); the namespace is the row's
+# identity, so a rebuild of one feed can never delete another's rows, and adding
+# a source means adding a line here rather than a new code path in the server.
+FEED_SPECS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("memory", "JEV_MEMORY_DIR", DEFAULT_MEMORY_DIR,
+     MEMORY_CHUNK_PREFIX, ENTITY_TYPE),
+    ("chats", "JEV_CORPUS_DIR", DEFAULT_CHATS_DIR,
+     CORPUS_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
+    ("projects", "JEV_PROJECTS_DIR", DEFAULT_PROJECTS_DIR,
+     PROJECT_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
+)
+
+
+class Feed(NamedTuple):
+    """One indexed directory: where it is, and how its rows are identified."""
+
+    name: str
+    prefix: str
+    directory: str
+    entity_type: str
+
+    @property
+    def env_var(self) -> str:
+        for name, env_var, *_ in FEED_SPECS:
+            if name == self.name:
+                return env_var
+        return ""
+
+
+def feeds() -> list[Feed]:
+    """The registry, with directories read from the environment *now*.
+
+    Read per call rather than at import: the service reads it once at start, and
+    a test that patches a directory must not have to reload the module to be
+    believed.
+    """
+    return [Feed(name=name, prefix=prefix, entity_type=entity_type,
+                 directory=os.getenv(env_var, default))
+            for name, env_var, default, prefix, entity_type in FEED_SPECS]
+
+
+def feed(name: str) -> Feed:
+    for candidate in feeds():
+        if candidate.name == name:
+            return candidate
+    known = ", ".join(candidate.name for candidate in feeds())
+    raise ValueError(f"unknown feed {name!r}; known feeds: {known}")
 
 
 def iter_markdown(root: Path) -> list[Path]:
@@ -171,6 +227,23 @@ def index_directory(connection: sqlite3.Connection, root: str | Path,
     }
 
 
+def index_feed(connection: sqlite3.Connection, name: str,
+               root: str | Path | None = None,
+               max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """Index one registered feed.  The service's single entry point.
+
+    Every feed goes through this: the id namespace comes from the registry, so a
+    feed that is added later cannot be indexed under someone else's namespace by
+    a caller that forgot to pass one.
+    """
+    spec = feed(name)
+    directory = Path(root) if root is not None else Path(spec.directory)
+    stats = index_directory(connection, directory, spec.prefix, spec.entity_type, max_chars)
+    stats["feed"] = spec.name
+    stats["prefix"] = spec.prefix
+    return stats
+
+
 def index_memory(connection: sqlite3.Connection, root: str | Path | None = None,
                  max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     """The working-memory directory: tagged rows, ``mem:`` ids."""
@@ -189,3 +262,14 @@ def index_corpus(connection: sqlite3.Connection, root: str | Path | None = None,
     """
     return index_directory(connection, Path(root or CORPUS_DIR), CORPUS_CHUNK_PREFIX,
                            ENTITY_TYPE_CORPUS, max_chars)
+
+
+def index_projects(connection: sqlite3.Connection, root: str | Path | None = None,
+                   max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """Collected project documentation and history: untagged rows, ``prj:`` ids.
+
+    Untagged like the chat corpus, and for the same reason: a project's README is
+    material, not the owner's own note, and the memory boost is for the notes.
+    """
+    return index_directory(connection, Path(root or feed("projects").directory),
+                           PROJECT_CHUNK_PREFIX, ENTITY_TYPE_CORPUS, max_chars)

@@ -33,6 +33,7 @@ from core.memory_index import (
     ENTITY_TYPE,
     ENTITY_TYPE_CORPUS,
     MEMORY_CHUNK_PREFIX,
+    PROJECT_CHUNK_PREFIX,
 )
 
 # The namespace every memory chunk carries, in FTS5 and here.  It is what makes
@@ -143,13 +144,12 @@ def memory_rows_from_fts5(db_path: str | Path) -> list[tuple[str, str, str]]:
         connection.close()
 
 
-def corpus_rows_from_fts5(db_path: str | Path) -> list[tuple[str, str, str]]:
-    """(chunk_id, content, source) for every imported-corpus row.
+def rows_from_fts5(db_path: str | Path, prefix: str) -> list[tuple[str, str, str]]:
+    """(chunk_id, content, source) for every row whose id carries this prefix.
 
-    Filtered by the id namespace here rather than by tag the way the memory rows
-    are: an imported row is deliberately untagged (`ENTITY_CORPUS` is the empty
-    string, which is also what a LightRAG corpus row carries), so the prefix is
-    the only thing that tells the two apart.
+    The generic reader behind `memory_rows_from_fts5` and
+    `corpus_rows_from_fts5`, so a new feed does not need a third copy of the same
+    query: the prefix is what identifies a namespace in this archive.
     """
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -158,11 +158,22 @@ def corpus_rows_from_fts5(db_path: str | Path) -> list[tuple[str, str, str]]:
             for chunk_id, content, source in connection.execute(
                 "SELECT chunk_id, content, source FROM chunks "
                 "WHERE chunk_id LIKE ? ORDER BY chunk_id",
-                (f"{CORPUS_CHUNK_PREFIX}%",),
+                (f"{prefix}%",),
             )
         ]
     finally:
         connection.close()
+
+
+def corpus_rows_from_fts5(db_path: str | Path) -> list[tuple[str, str, str]]:
+    """The imported chat corpus, by its id namespace.
+
+    Filtered by namespace here rather than by tag the way the memory rows are: an
+    imported row is deliberately untagged (`ENTITY_CORPUS` is the empty string,
+    which is also what a LightRAG corpus row carries), so the prefix is the only
+    thing that tells the two apart.
+    """
+    return rows_from_fts5(db_path, CORPUS_CHUNK_PREFIX)
 
 
 def corpus_rows(index: dict) -> int:
@@ -199,14 +210,16 @@ def prune_excluded(index: dict, markers: tuple[str, ...] | None = None) -> tuple
     return pruned, stats
 
 
-def _merge_namespace(index: dict, chunks: Sequence[tuple[str, str, str]],
-                     embeddings: np.ndarray, domains: Iterable[str] | None,
-                     prefix: str, entity_type: str) -> tuple[dict, int]:
+def merge_namespace(index: dict, chunks: Sequence[tuple[str, str, str]],
+                    embeddings: np.ndarray, domains: Iterable[str] | None,
+                    prefix: str, entity_type: str = ENTITY_CORPUS) -> tuple[dict, int]:
     """Replace every row whose chunk id carries `prefix`; append these. Pure.
 
-    One implementation for both namespaces, because the invariants are identical
+    One implementation for every namespace, because the invariants are identical
     and a second copy would be a second chance to get the dimension check or the
-    corpus-preserving slice wrong.
+    corpus-preserving slice wrong.  The namespace is the prefix: a caller that
+    passes the wrong one cannot silently overwrite another feed's rows, because
+    a prefix that matches nothing replaces nothing.
     """
     if len(chunks) != len(embeddings):
         raise VectorIndexError(
@@ -256,8 +269,8 @@ def merge_memory(index: dict, chunks: Sequence[tuple[str, str, str]],
     and that is asserted rather than assumed (see the tests): losing them would
     silently empty the index for every corpus query.
     """
-    merged, replaced = _merge_namespace(index, chunks, embeddings, domains,
-                                        MEMORY_CHUNK_PREFIX, ENTITY_MEMORY)
+    merged, replaced = merge_namespace(index, chunks, embeddings, domains,
+                                       MEMORY_CHUNK_PREFIX, ENTITY_MEMORY)
     stats = {
         "corpus": corpus_rows(merged),
         "memory_replaced": replaced,
@@ -276,8 +289,8 @@ def merge_corpus(index: dict, chunks: Sequence[tuple[str, str, str]],
     FTS5 would answer a literal query while a paraphrase still returned the
     nearest unrelated neighbour, which is the defect the import was fixing.
     """
-    merged, replaced = _merge_namespace(index, chunks, embeddings, domains,
-                                        CORPUS_CHUNK_PREFIX, ENTITY_CORPUS)
+    merged, replaced = merge_namespace(index, chunks, embeddings, domains,
+                                       CORPUS_CHUNK_PREFIX, ENTITY_CORPUS)
     stats = {
         "memory": sum(1 for cid in merged["chunk_ids"]
                       if str(cid).startswith(MEMORY_CHUNK_PREFIX)),

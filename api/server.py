@@ -50,7 +50,7 @@ from core.router import (
     Strategy,
     fast_path_reason,
 )
-from core.memory_index import CORPUS_DIR, MEMORY_DIR, index_corpus, index_memory
+from core.memory_index import CORPUS_DIR, MEMORY_DIR, feeds, index_feed
 from core.shadow import ShadowProbe, ShadowTarget
 from agents.base import (
     GeneralAgent, CodeAgent, DBAgent, TroubleshooterAgent,
@@ -288,12 +288,10 @@ async def lifespan(app: FastAPI):
 
     # Index existing LightRAG chunks into FTS5
     await _index_lightrag_chunks()
-    # Then the working-memory documents.  Order matters: the rebuild above starts
-    # with clear(), so anything indexed before it would be deleted immediately.
-    await _index_memory_docs()
-    # Then the imported chat corpus, which is indexed the same way and for the
-    # same reason: an answer that lives only in an export is not findable.
-    await _index_corpus_docs()
+    # Then every registered feed.  Order matters for all of them: the rebuild
+    # above starts with clear(), so anything indexed before it would be deleted
+    # immediately.
+    await _index_feeds()
     # Then pull the embedder into memory while nobody is waiting.  Not awaited:
     # see _warm_embedder for why a start must not block on GPU2.
     global _warmup_task
@@ -402,55 +400,37 @@ async def _index_lightrag_chunks():
         print(f"[Jev] FTS5 indexing error: {e}")
 
 
-async def _index_memory_docs():
-    """Index the working-memory directory into FTS5 as part of the same rebuild.
+async def _index_feeds():
+    """Index every registered feed into FTS5 as part of the same rebuild.
 
-    Additive: it writes rows the router's own search already knows how to read
-    (`entity_type='memory'`), and changes no routing, gating or ranking
-    behaviour.  The FTS5 table is a *derived* index - thrown away and rebuilt on
-    every start - so without this step the memory documents indexed by
-    `scripts/index_memory.py` survive only until the next restart.  Measured
-    before this was added: restart took the index from 4593 rows to 4562, with
-    zero memory rows left.
+    One code path for all of them, because they differ only in directory, chunk-id
+    namespace and row tag (`core.memory_index.FEED_SPECS`).  The FTS5 table is a
+    *derived* index - thrown away and rebuilt on every start - so without this
+    step the rows indexed by the CLI scripts survive only until the next restart.
+    Measured before this existed: a restart took the index from 4593 rows to 4562,
+    with zero memory rows left.
 
-    A missing directory is not an error: the router has to start on a machine
-    where `/home/dry/memory` has not been created yet.
+    Two rules, both learned the hard way:
+
+      * a missing directory is not an error - the router has to start on a machine
+        where a feed has not been collected yet;
+      * one broken feed must not stop the others, so each is indexed in its own
+        try.  A feed is a directory of files someone else's tool wrote, and a
+        single unreadable file used to be enough to leave the whole base empty.
     """
-    try:
-        stats = index_memory(router.tier2.conn)
+    for spec in feeds():
+        try:
+            stats = index_feed(router.tier2.conn, spec.name)
+        except Exception as e:
+            print(f"[Jev] feed {spec.name} ({spec.prefix}) indexing error: {e}")
+            continue
         if not stats["exists"]:
-            print(f"[Jev] memory directory not found: {stats['root']} (skipped)")
-            return
-        print(f"[Jev] Indexed {stats['inserted']} memory chunks from "
+            print(f"[Jev] feed {spec.name} ({spec.prefix}): "
+                  f"{stats['root']} not found (skipped)")
+            continue
+        print(f"[Jev] feed {spec.name} ({spec.prefix}): {stats['inserted']} chunks from "
               f"{stats['files']} files in {stats['root']} "
               f"(replaced {stats['removed']}, {stats['chars']} chars)")
-    except Exception as e:
-        print(f"[Jev] memory indexing error: {e}")
-
-
-async def _index_corpus_docs():
-    """Index the imported chat corpus into FTS5 as part of the same rebuild.
-
-    A second directory, the same code path as the memory documents, and the same
-    reason: this table is thrown away and rebuilt on every start, so rows written
-    into it by hand do not survive.  The corpus is what `scripts/
-    import_chat_export.py` wrote from a Takeout export - conversations that exist
-    nowhere else on this machine.
-
-    Separate from the memory step rather than merged into it, because the two
-    directories have different owners and different ids (`gem:` vs `mem:`): one
-    being empty, or deleted, must not affect the other.
-    """
-    try:
-        stats = index_corpus(router.tier2.conn)
-        if not stats["exists"]:
-            print(f"[Jev] corpus directory not found: {stats['root']} (skipped)")
-            return
-        print(f"[Jev] Indexed {stats['inserted']} chat-corpus chunks from "
-              f"{stats['files']} files in {stats['root']} "
-              f"(replaced {stats['removed']}, {stats['chars']} chars)")
-    except Exception as e:
-        print(f"[Jev] corpus indexing error: {e}")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────
