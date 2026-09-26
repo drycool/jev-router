@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from core.memory_index import MEMORY_CHUNK_PREFIX
 from core.router import JevRouter, Strategy, _gate_selection, _is_fts_exact
 from scripts.check_memory_contamination import competitors
 
@@ -179,8 +180,33 @@ class MemoryContaminationTests(unittest.TestCase):
             "garageos.md"), [])
 
     def test_the_raw_corpus_is_never_reported(self):
-        rows = [("raw", "болтов головки блока цилиндров момент", RAW_SOURCE)]
+        rows = [(MEMORY_CHUNK_PREFIX + "raw",
+                 "болтов головки блока цилиндров момент", RAW_SOURCE)]
         self.assertEqual(competitors(rows, QUERY, "d_espero.pdf"), [])
+
+    def test_a_collected_source_is_not_held_to_the_memory_rule(self):
+        """The repository's own history quotes the control queries by design.
+
+        This project records its measurements in commit messages and in the README,
+        and once those were indexed the guard reported 22 competitors - all of them
+        legitimate.  Rewriting history to satisfy a guard is not a fix, so the rule
+        applies to the material written *about* the system, not to a collected
+        source that happens to contain the words.
+        """
+        rows = [
+            ("prj:Jev__commits.md#29",
+             "«Кабели для Raspberry Pi 5» — порог и замер",
+             "/home/dry/LightRag/feeds/projects/Jev__commits.md"),
+            ("gem:chat.md#0", "Кабели для Raspberry Pi 5 обсуждали в чате",
+             "/home/dry/LightRag/feeds/chats/chat.md"),
+        ]
+        self.assertEqual(competitors(rows, "Кабели для Raspberry Pi 5", "Gemini"), [])
+
+    def test_the_memory_namespace_is_still_watched(self):
+        rows = [("mem:projects/x.md#1", "запрос про кабели (Raspberry Pi) ушёл в vector_fast",
+                 "/home/dry/memory/projects/x.md")]
+        found = competitors(rows, "Кабели для Raspberry Pi 5", "Gemini")
+        self.assertEqual([chunk_id for chunk_id, _ in found], ["mem:projects/x.md#1"])
 
     def test_a_clean_description_is_clean(self):
         rows = [("mem:projects/x.md#1", "запрос про периферию Pi5",
