@@ -109,7 +109,18 @@ def _running_under_test() -> bool:
     TestProductionLogsAreProtected reported the damage only after the writes had happened.
     A canary reports; it does not prevent. The check therefore lives where the write
     happens, and does not depend on how anyone started the suite.
+
+    Two runners are recognised, because the guard has to hold for the runner someone
+    actually reaches for. `unittest` is this project's gate; `pytest` is not, but it is the
+    obvious first thing to try, and it does not import `unittest` before the test modules
+    unless its own unittest plugin is loaded. Measured: under `pytest` the unittest-only
+    check returned False, `tests/__init__.py` had not been imported either, and the suite
+    ran against the production log -
+    `test_the_redirect_does_not_depend_on_how_the_suite_was_started` failed on exactly that.
+    A test runner the guard does not know about is a test runner that writes to production.
     """
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        return True
     if "unittest" not in sys.modules:
         return False
     return any(name == "tests" or name.startswith("test_") for name in sys.modules)
