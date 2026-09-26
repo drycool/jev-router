@@ -713,6 +713,11 @@ def _record_decision(
             # coarse question ("may facts be stated?") without re-deriving it from the
             # taxonomy - and so a drift between the two would be visible in the log itself.
             "local_material_decisive": result.routing_decision.local_material_decisive,
+            # The chance level that verdict was measured against.  Absent when the vector
+            # tier did not run, or the corpus was too small for a quantile to mean
+            # anything.  Without it the journal keeps the label and loses the measurement
+            # behind it, and the next recalibration has to rebuild the corpus to know why.
+            "decisive_floor": result.routing_decision.decisive_floor,
             "keywords": result.extracted_metadata.keywords,
             "entities": result.extracted_metadata.entities,
             "domain": result.extracted_metadata.domain,
@@ -908,6 +913,10 @@ async def query(req: QueryRequest):
             # The one bit a consumer needs to decide whether it may state facts about the
             # project. Derived from the strategy, so it cannot disagree with it.
             "local_material_decisive": result.routing_decision.local_material_decisive,
+            # What that verdict was measured against: this query's chance-level similarity
+            # to the corpus.  A consumer auditing a decisive label - or a refusal - needs
+            # the number, not only the verdict.
+            "decisive_floor": result.routing_decision.decisive_floor,
         },
         extracted_metadata={
             "intent": result.extracted_metadata.intent,
@@ -1100,6 +1109,10 @@ async def route_only(query: str = Query(..., min_length=1, max_length=16000)):
             # The one bit a consumer needs to decide whether it may state facts about the
             # project. Derived from the strategy, so it cannot disagree with it.
             "local_material_decisive": result.routing_decision.local_material_decisive,
+            # What that verdict was measured against: this query's chance-level similarity
+            # to the corpus.  A consumer auditing a decisive label - or a refusal - needs
+            # the number, not only the verdict.
+            "decisive_floor": result.routing_decision.decisive_floor,
         },
         "extracted_metadata": {
             "intent": result.extracted_metadata.intent,

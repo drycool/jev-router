@@ -36,6 +36,55 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # with `.env` on the embedding budget - a default is a second opinion, and it must not be a
 # different one.
 SIMILARITY_THRESHOLD = float(os.getenv("JEV_SIMILARITY_THRESHOLD", "0.45"))
+
+# The decisive bar is not one number any more.  0.45 was calibrated when the corpus held
+# 209 rows; it holds 858 vectors over 5269 chunks now, the noise floor rose with it, and
+# measured on 2026-09-26 three of six questions the corpus cannot answer at all (a cat, a
+# currency rate, a tax letter) were labelled *decisive*, with 1766 characters of selected
+# text as the evidence.  An absolute number cannot express "this hit stands out", because
+# what stands out depends on how similar the corpus happens to be to this question *by
+# chance* - and that is a property of the corpus, not of the number.
+#
+# So the decisive exit takes two conditions: the absolute floor above, and a margin over
+# this query's own chance level, measured as a high quantile of its similarity to the
+# whole corpus.  Calibrated on 13 fixed questions - 7 the corpus can answer, 6 it cannot -
+# by scripts/measure_decisive_criterion.py: at margin 0.10 and quantile 0.95 all 7
+# positives stayed decisive and all 6 negatives were refused, with 0.0148 of slack on the
+# positive side and 0.0044 on the negative.  Those slacks are thin, and that is the honest
+# reading of the measurement: on this corpus one cosine separates the two sets only barely.
+# The instrument is in the repository because the same table has to be taken again every
+# time the corpus grows by an order of magnitude - which the chat import will do.
+#
+# Neither condition alone works: the margin alone calls "how much is a train ticket to
+# Lviv" decisive (its top hit stands 0.13 above its own floor, more than several real
+# answers), and the floor alone is what failed in the first place.
+DECISIVE_MARGIN = float(os.getenv("JEV_DECISIVE_MARGIN", "0.10"))
+DECISIVE_FLOOR_QUANTILE = float(os.getenv("JEV_DECISIVE_FLOOR_QUANTILE", "0.95"))
+# Below this many chunks the quantile is one of the hits themselves, so "standing out from
+# the corpus" stops being measurable and the absolute floor is the whole rule.  This keeps
+# small corpora - a fresh install, a test fixture - behaving as they did before.
+DECISIVE_MIN_CORPUS = int(os.getenv("JEV_DECISIVE_MIN_CORPUS", "128"))
+
+
+def decisive_hit(best_score: float, floor: Optional[float], margin: Optional[float] = None) -> bool:
+    """Whether the best local hit may be called decisive.
+
+    Two conditions, because neither works alone.  The absolute floor keeps a weak hit out
+    wherever it came from; the margin over this query's own chance level (``floor``, from
+    ``Tier2Search.corpus_floor``) keeps out a hit that is no better than the corpus's
+    accidental similarity to the question.  ``floor`` of None means it could not be
+    measured - a corpus too small for a quantile - and then the absolute floor is the whole
+    rule, which is how this behaved before there was a second condition.
+
+    The measurements behind both numbers, and the ones that failed, are in
+    scripts/measure_decisive_criterion.py: the margin alone calls "how much is a train
+    ticket to Lviv" decisive, and the floor alone calls a cat question decisive.
+    """
+    if best_score < SIMILARITY_THRESHOLD:
+        return False
+    if floor is None:
+        return True
+    return best_score >= floor + (DECISIVE_MARGIN if margin is None else margin)
 FTS5_DB_PATH = os.getenv("JEV_FTS5_DB_PATH", str(PROJECT_ROOT / "storage" / "jev_fts5.db"))
 VECTOR_DB_PATH = os.getenv("JEV_VECTOR_DB_PATH", str(PROJECT_ROOT / "storage" / "jev_vectors.npz"))
 LIGHTRAG_API = os.getenv("JEV_LIGHTRAG_API", "http://localhost:8020")
@@ -263,6 +312,11 @@ class RoutingDecision:
     # `fast_path_exit: false` on a request that had in fact skipped the LLM, and the
     # opposite. What tier 1 concluded is now called what it is.
     tier1_exit: bool
+    # This query's chance level against the corpus, when the vector tier measured it.
+    # A decisive verdict now means "the top hit stands DECISIVE_MARGIN above this number",
+    # so recording it is what makes the verdict auditable later: a threshold study can see
+    # how far the hit stood out, instead of taking a label on faith.
+    decisive_floor: Optional[float] = None
 
     @property
     def local_material_decisive(self) -> bool:
@@ -320,7 +374,9 @@ FAST_PATH_NO_EXIT: frozenset[Strategy] = frozenset({
     Strategy.GRAPH_LIGHTRAG,       # parked; and a graph answer is composed, not retrieved
     Strategy.GENERAL_LLM,          # nothing local: the LLM is the only source
     Strategy.FTS_FALLBACK,         # rows found, gate refused: hypothesis only
-    Strategy.VECTOR_LOW_CONFIDENCE,  # neighbours existed, none cleared the bar
+    Strategy.VECTOR_LOW_CONFIDENCE,  # neighbours existed, none decisive: either they missed
+    #                                  the absolute bar or they cleared it without standing
+    #                                  DECISIVE_MARGIN above this query's own noise floor
     Strategy.EMBEDDING_TIMEOUT,    # the retriever did not answer: no corpus conclusion
 })
 
@@ -870,22 +926,17 @@ class Tier2Search:
             })
         return results
 
-    def search_vector(self, query: str, query_embedding: np.ndarray, limit: Optional[int] = None, domain: str = "general", apply_threshold: bool = True) -> list[dict]:
-        """Vector cosine similarity search. ~10-30ms. Same pool depth as the FTS path.
+    def _score_corpus(self, query_embedding: np.ndarray, domain: str):
+        """Score every chunk in the corpus against the query.
 
-        ``apply_threshold`` drops the neighbours that score below
-        ``SIMILARITY_THRESHOLD``, which is what the decisive exit wants.  Callers
-        that need to *report* on the tier rather than act on it pass ``False``: the
-        threshold filter used to be unconditional, so a request whose neighbours all
-        fell short saw an empty list and could not tell "the tier ran and found only
-        weak neighbours" from "the tier did not run at all"."""
-
-        if limit is None:
-            limit = RETRIEVAL_LIMIT
-        t0 = time.perf_counter()
+        One implementation, deliberately: the search and the decisive criterion have to
+        look at the same numbers.  A second copy of the mask-and-normalise logic is how
+        the retrieved hit and the criterion that judges it drift apart, and this branch
+        has paid for that mistake more than once already.
+        """
         index = self._load_vector_index()
         if index is None:
-            return []
+            return None
         embeddings = index["embeddings"]
         chunk_ids = index["chunk_ids"]
         contents = index["contents"]
@@ -898,7 +949,7 @@ class Tier2Search:
         dimension = index["dimension"]
 
         if len(embeddings) == 0:
-            return []
+            return None
         if (
             embeddings.ndim != 2
             or model != EMBEDDING_MODEL
@@ -908,13 +959,13 @@ class Tier2Search:
         ):
             # A stale index or one built with another model must never be
             # searched: incomparable vectors would create false confidence.
-            return []
+            return None
 
         # Cosine similarity
         if domain != "general":
             mask = domains.astype(str) == domain
             if not np.any(mask):
-                return []
+                return None
             embeddings = embeddings[mask]
             chunk_ids, contents, sources = chunk_ids[mask], contents[mask], sources[mask]
             if entity_types is not None:
@@ -925,6 +976,51 @@ class Tier2Search:
         q_norm = query_embedding / (np.linalg.norm(query_embedding) or 1)
 
         scores = normalized @ q_norm
+        return scores, chunk_ids, contents, sources, entity_types
+
+    def corpus_floor(self, query_embedding: np.ndarray, domain: str = "general",
+                     quantile: Optional[float] = None) -> Optional[float]:
+        """How similar this query is to the corpus *by chance*.
+
+        The number the decisive criterion subtracts from the top hit.  A question about a
+        topic the corpus covers densely reaches a high similarity against many chunks
+        without any of them being the answer, so the same cosine means different things for
+        different questions - which is exactly what one absolute threshold cannot express.
+
+        Returns None when the corpus is too small for a quantile to mean anything, and
+        callers then fall back to the absolute floor alone.
+        """
+        if quantile is None:
+            quantile = DECISIVE_FLOOR_QUANTILE
+        scored = self._score_corpus(query_embedding, domain)
+        if scored is None:
+            return None
+        scores = scored[0]
+        if len(scores) < DECISIVE_MIN_CORPUS:
+            return None
+        return float(np.quantile(scores, quantile))
+
+    def search_vector(self, query: str, query_embedding: np.ndarray, limit: Optional[int] = None, domain: str = "general", apply_threshold: bool = True) -> list[dict]:
+        """Vector cosine similarity search. ~10-30ms. Same pool depth as the FTS path.
+
+        ``apply_threshold`` drops the neighbours that score below
+        ``SIMILARITY_THRESHOLD``, which is what the decisive exit wants.  Callers
+        that need to *report* on the tier rather than act on it pass ``False``: the
+        threshold filter used to be unconditional, so a request whose neighbours all
+        fell short saw an empty list and could not tell "the tier ran and found only
+        weak neighbours" from "the tier did not run at all".
+
+        Clearing the threshold is *not* the decisive verdict: whether a hit stands out
+        from this query's chance level is measured separately, by ``corpus_floor``.
+        """
+
+        if limit is None:
+            limit = RETRIEVAL_LIMIT
+        t0 = time.perf_counter()
+        scored = self._score_corpus(query_embedding, domain)
+        if scored is None:
+            return []
+        scores, chunk_ids, contents, sources, entity_types = scored
         top_indices = np.argsort(scores)[::-1][:limit]
 
         results = []
@@ -1200,10 +1296,20 @@ class JevRouter:
 
         # Check vector similarity threshold
         best_score = vector_results[0]["score"] if vector_results else 0.0
+        # ...and check that the hit stands out from this query's own chance level against
+        # the corpus.  One absolute number could not do it: the corpus grew from 209 rows
+        # to 5269 chunks, the noise floor rose with it, and three of six questions the
+        # corpus cannot answer at all were coming back labelled decisive.  Measured above
+        # the threshold and below the margin means "there is material, but it is not the
+        # answer" - which is what vector_low_confidence reports and what the caller is
+        # asked to judge for itself.
+        decisive_floor = None
+        if best_score >= SIMILARITY_THRESHOLD and query_embedding is not None:
+            decisive_floor = self.tier2.corpus_floor(query_embedding, domain=domain)
         # The classifier no longer vetoes this exit.  Its strategy label comes
         # from the invented taxonomy, and a label that is wrong two times in
         # three must not be able to suppress a good vector hit.
-        if best_score >= SIMILARITY_THRESHOLD:
+        if decisive_hit(best_score, decisive_floor):
             # When the gate held raw rows back, they ride along after the
             # vector hits instead of being dropped: the manual is excluded
             # from the vector index on purpose, so dropping them here would
@@ -1221,6 +1327,7 @@ class JevRouter:
                     strategy=Strategy.VECTOR_FAST,
                     confidence_score=best_score,
                     tier1_exit=False,
+                    decisive_floor=decisive_floor,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent="vector_search",
@@ -1291,12 +1398,14 @@ class JevRouter:
             # fts_fallback would have said.  The context is still local rows, and the
             # consumer is expected to read this status, not the context, as the verdict.
             #
-            # Reaching this branch at all means the decisive exits above were not
-            # taken, so any neighbour here is below JEV_SIMILARITY_THRESHOLD: the same
-            # label as a hit that cleared the bar would hide the only difference there
-            # is.  The neighbours are *reported*, not served - the calibrated bar
-            # exists to keep them out of the context, and the local rows keep their
-            # place in it.
+            # Reaching this branch at all means the decisive exits above were not taken.
+            # Two different situations arrive here now, and both are "material, but not the
+            # answer": neighbours that did not clear JEV_SIMILARITY_THRESHOLD at all, and
+            # neighbours that cleared it but did not stand DECISIVE_MARGIN above this
+            # query's own chance level against the corpus.  The second group used to be
+            # called decisive, which is how a question about a cat came back with wiring
+            # instructions labelled as the answer.  Their material is served - the caller
+            # judges it - and the label says it is not a verdict.
             #
             # The last case is not a fallback to FTS - there is no FTS row behind
             # it - so it is not labelled as one.  It is the only case where the
@@ -1327,6 +1436,7 @@ class JevRouter:
                     strategy=strategy,
                     confidence_score=confidence,
                     tier1_exit=False,
+                    decisive_floor=decisive_floor,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent=intent,
