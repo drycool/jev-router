@@ -28,11 +28,23 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 
+from core.memory_index import (
+    CORPUS_CHUNK_PREFIX,
+    ENTITY_TYPE,
+    ENTITY_TYPE_CORPUS,
+    MEMORY_CHUNK_PREFIX,
+)
+
 # The namespace every memory chunk carries, in FTS5 and here.  It is what makes
 # the merge idempotent: memory rows are recognised and replaced, corpus rows are
-# never touched.
-MEMORY_CHUNK_PREFIX = "mem:"
-ENTITY_MEMORY = "memory"
+# never touched.  The prefix is defined next to the indexer that writes it
+# (`core.memory_index`): an id format that two modules each spell out is a format
+# that will eventually differ between them.
+#
+# `ENTITY_MEMORY` keeps its old name because callers and the tests import it
+# from here; the tag itself has one definition, in the module that writes rows.
+ENTITY_MEMORY = ENTITY_TYPE
+ENTITY_CORPUS = ENTITY_TYPE_CORPUS
 
 # Sources that must not reach the vector index at all.
 #
@@ -131,6 +143,28 @@ def memory_rows_from_fts5(db_path: str | Path) -> list[tuple[str, str, str]]:
         connection.close()
 
 
+def corpus_rows_from_fts5(db_path: str | Path) -> list[tuple[str, str, str]]:
+    """(chunk_id, content, source) for every imported-corpus row.
+
+    Filtered by the id namespace here rather than by tag the way the memory rows
+    are: an imported row is deliberately untagged (`ENTITY_CORPUS` is the empty
+    string, which is also what a LightRAG corpus row carries), so the prefix is
+    the only thing that tells the two apart.
+    """
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return [
+            (str(chunk_id), str(content), str(source))
+            for chunk_id, content, source in connection.execute(
+                "SELECT chunk_id, content, source FROM chunks "
+                "WHERE chunk_id LIKE ? ORDER BY chunk_id",
+                (f"{CORPUS_CHUNK_PREFIX}%",),
+            )
+        ]
+    finally:
+        connection.close()
+
+
 def corpus_rows(index: dict) -> int:
     """How many rows are not memory rows."""
     return sum(1 for cid in index["chunk_ids"]
@@ -165,15 +199,14 @@ def prune_excluded(index: dict, markers: tuple[str, ...] | None = None) -> tuple
     return pruned, stats
 
 
-def merge_memory(index: dict, chunks: Sequence[tuple[str, str, str]],
-                 embeddings: np.ndarray, domains: Iterable[str] | None = None) -> tuple[dict, dict]:
-    """Return a new index with the memory rows replaced by these ones.
+def _merge_namespace(index: dict, chunks: Sequence[tuple[str, str, str]],
+                     embeddings: np.ndarray, domains: Iterable[str] | None,
+                     prefix: str, entity_type: str) -> tuple[dict, int]:
+    """Replace every row whose chunk id carries `prefix`; append these. Pure.
 
-    Pure: no network, no filesystem.  Idempotent by construction - rows whose id
-    carries the memory prefix are dropped before the new ones are appended, so
-    running it twice leaves one copy.  Corpus rows are copied through untouched,
-    and that is asserted rather than assumed (see the tests): losing them would
-    silently empty the index for every corpus query.
+    One implementation for both namespaces, because the invariants are identical
+    and a second copy would be a second chance to get the dimension check or the
+    corpus-preserving slice wrong.
     """
     if len(chunks) != len(embeddings):
         raise VectorIndexError(
@@ -191,7 +224,7 @@ def merge_memory(index: dict, chunks: Sequence[tuple[str, str, str]],
     if len(domains) != len(chunks):
         raise VectorIndexError(f"{len(chunks)} chunks but {len(domains)} domains")
 
-    keep = np.asarray([not str(cid).startswith(MEMORY_CHUNK_PREFIX)
+    keep = np.asarray([not str(cid).startswith(prefix)
                        for cid in index["chunk_ids"]], dtype=bool)
     replaced = int((~keep).sum())
 
@@ -206,14 +239,50 @@ def merge_memory(index: dict, chunks: Sequence[tuple[str, str, str]],
                                    np.asarray([c[2] for c in chunks])]),
         "domains": np.concatenate([index["domains"][keep], np.asarray(domains)]),
         "entity_types": np.concatenate([index["entity_types"][keep],
-                                        np.asarray([ENTITY_MEMORY] * len(chunks))]),
+                                        np.asarray([entity_type] * len(chunks))]),
         "model": index["model"],
         "dimension": dimension,
     }
+    return merged, replaced
+
+
+def merge_memory(index: dict, chunks: Sequence[tuple[str, str, str]],
+                 embeddings: np.ndarray, domains: Iterable[str] | None = None) -> tuple[dict, dict]:
+    """Return a new index with the memory rows replaced by these ones.
+
+    Pure: no network, no filesystem.  Idempotent by construction - rows whose id
+    carries the memory prefix are dropped before the new ones are appended, so
+    running it twice leaves one copy.  Corpus rows are copied through untouched,
+    and that is asserted rather than assumed (see the tests): losing them would
+    silently empty the index for every corpus query.
+    """
+    merged, replaced = _merge_namespace(index, chunks, embeddings, domains,
+                                        MEMORY_CHUNK_PREFIX, ENTITY_MEMORY)
     stats = {
         "corpus": corpus_rows(merged),
         "memory_replaced": replaced,
         "memory_added": len(chunks),
+        "total": len(merged["chunk_ids"]),
+    }
+    return merged, stats
+
+
+def merge_corpus(index: dict, chunks: Sequence[tuple[str, str, str]],
+                 embeddings: np.ndarray, domains: Iterable[str] | None = None) -> tuple[dict, dict]:
+    """Return a new index with the imported-corpus rows replaced by these ones.
+
+    The corpus counterpart of `merge_memory`, and pure for the same reason.  It
+    exists because the archive is built by a script: an import that only reached
+    FTS5 would answer a literal query while a paraphrase still returned the
+    nearest unrelated neighbour, which is the defect the import was fixing.
+    """
+    merged, replaced = _merge_namespace(index, chunks, embeddings, domains,
+                                        CORPUS_CHUNK_PREFIX, ENTITY_CORPUS)
+    stats = {
+        "memory": sum(1 for cid in merged["chunk_ids"]
+                      if str(cid).startswith(MEMORY_CHUNK_PREFIX)),
+        "corpus_replaced": replaced,
+        "corpus_added": len(chunks),
         "total": len(merged["chunk_ids"]),
     }
     return merged, stats

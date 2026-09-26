@@ -5,11 +5,12 @@ The index is an NPZ archive, not a pickle: loading it cannot execute code.
 It records the embedding model and dimension; the router rejects mismatches.
 
 A full rebuild is the expensive path (one embed call per corpus chunk).  It also
-merges the memory documents at the end, because otherwise a rebuild would
-silently drop them: the archive would look healthy while the memory documents
-became unfindable in the vector tier - the same defect class the FTS5 rebuild
-had.  Use scripts/build_memory_vectors.py for the cheap incremental update of
-just the memory rows.
+merges the rows that live only in FTS5 at the end - the memory documents and the
+imported chat corpus - because otherwise a rebuild would silently drop them: the
+archive would look healthy while those documents became unfindable in the vector
+tier, the same defect class the FTS5 rebuild had.  Use
+scripts/build_memory_vectors.py for the cheap incremental update of one
+namespace.
 
 Chunks whose source matches `JEV_VECTOR_EXCLUDE_SOURCES` (default: the OCR'd
 Espero manual) are filtered out before embedding and again before writing, so the
@@ -33,11 +34,17 @@ import httpx
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from core.env import load_env
+
+load_env()
+
 from core.router import detect_domain
 from core.vector_index import (
+    corpus_rows_from_fts5,
     embed_texts,
     is_excluded_source,
     memory_rows_from_fts5,
+    merge_corpus,
     merge_memory,
     prune_excluded,
     save_index,
@@ -115,6 +122,34 @@ async def build(args: argparse.Namespace) -> None:
 
         if args.include_memory:
             await _merge_memory(client, args, index)
+        if args.include_corpus:
+            await _merge_corpus(client, args, index)
+
+
+async def _merge_corpus(client: httpx.AsyncClient, args: argparse.Namespace, index: dict) -> None:
+    """Append the imported chat corpus to a freshly rebuilt corpus index.
+
+    Same reason as `_merge_memory`: the rebuild above reads the LightRAG chunk
+    store, and an imported conversation was never in that store.  Without this,
+    the next rebuild would drop the import - the archive would look healthy while
+    those conversations became unfindable in the vector tier.
+    """
+    database = Path(args.memory_db)
+    if not database.exists():
+        print(f"corpus: no FTS5 database at {database}, skipped")
+        return
+    chunks = corpus_rows_from_fts5(database)
+    if not chunks:
+        print(f"corpus: no imported rows in {database.name}, nothing to merge")
+        return
+    embeddings = await embed_texts(client, args.api, args.model,
+                                   [content for _, content, _ in chunks],
+                                   batch_size=args.batch_size)
+    domains = [detect_domain(f"{source}\n{content}") for _, content, source in chunks]
+    merged, stats = merge_corpus(index, chunks, embeddings, domains)
+    save_index(args.output, merged)
+    print(f"corpus: merged {stats['corpus_added']} chunks from {database.name} "
+          f"(replaced {stats['corpus_replaced']}) -> {stats['total']} vectors total")
 
 
 async def _merge_memory(client: httpx.AsyncClient, args: argparse.Namespace, index: dict) -> None:
@@ -153,7 +188,9 @@ def main() -> None:
                         help="FTS5 database the memory rows are read from")
     parser.add_argument("--no-memory", dest="include_memory", action="store_false",
                         help="build the corpus index only (memory rows are dropped)")
-    parser.set_defaults(include_memory=True)
+    parser.add_argument("--no-corpus", dest="include_corpus", action="store_false",
+                        help="leave the imported chat corpus out of the archive")
+    parser.set_defaults(include_memory=True, include_corpus=True)
     asyncio.run(build(parser.parse_args()))
 
 

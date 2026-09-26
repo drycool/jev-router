@@ -18,6 +18,14 @@ The chunk prefix ``"<document title> :: <section>"`` is load-bearing.  A chunk
 retrieved on its own has to say what it is about; the probe showed the delivered
 context for the systemd question starting with
 ``"Деплой демонов: systemd --user :: Установка юнита"``.
+
+There are now two such directories - the working-memory documents and the
+imported chat corpus (``scripts/import_chat_export.py`` writes it) - and both go
+through ``index_directory``.  They differ only in their chunk-id namespace
+(``mem:`` / ``gem:``) and in the tag their rows carry.  The namespace is the
+row's identity: ``replace_rows`` deletes by it, so re-indexing one directory can
+never delete the other's rows, and ``core.vector_index`` recognises memory rows
+by the same ``mem:`` prefix.
 """
 from __future__ import annotations
 
@@ -26,10 +34,17 @@ import re
 import sqlite3
 from pathlib import Path
 
-# Read once at import, like the router's own settings; ``index_memory`` accepts
-# an explicit root so callers (and tests) are never forced to touch the env.
+# Read once at import, like the router's own settings; the indexers accept an
+# explicit root so callers (and tests) are never forced to touch the env.
 MEMORY_DIR = os.getenv("JEV_MEMORY_DIR", "/home/dry/memory")
+# An answer that lives only in an export is not findable, and the discussion
+# about a UPS HAT existed only in the export: 351 conversations, one of them in
+# the corpus.  This directory is what the importer writes and the server indexes.
+CORPUS_DIR = os.getenv("JEV_CORPUS_DIR", "/home/dry/LightRag/gemini_chats")
 ENTITY_TYPE = "memory"
+ENTITY_TYPE_CORPUS = ""
+MEMORY_CHUNK_PREFIX = "mem:"
+CORPUS_CHUNK_PREFIX = "gem:"
 # The server indexes LightRAG chunks at 2000 characters; staying under that keeps
 # one document from being penalised relative to another by the BM25 length norm.
 DEFAULT_MAX_CHARS = 1800
@@ -85,11 +100,12 @@ def split_too_long(block: str, max_chars: int) -> list[str]:
     return parts
 
 
-def build_chunks(root: Path, max_chars: int = DEFAULT_MAX_CHARS) -> list[tuple[str, str, str]]:
+def build_chunks(root: Path, max_chars: int = DEFAULT_MAX_CHARS,
+                 prefix: str = MEMORY_CHUNK_PREFIX) -> list[tuple[str, str, str]]:
     """Return (chunk_id, content, source) for every chunk under root.
 
-    chunk_id is ``mem:<path relative to root>#<n>`` - stable across runs, so a
-    re-index replaces a document rather than accumulating copies of it.
+    chunk_id is ``<prefix><path relative to root>#<n>`` - stable across runs, so
+    a re-index replaces a document rather than accumulating copies of it.
     """
     chunks: list[tuple[str, str, str]] = []
     for path in iter_markdown(root):
@@ -101,21 +117,27 @@ def build_chunks(root: Path, max_chars: int = DEFAULT_MAX_CHARS) -> list[tuple[s
             header = f"{title} :: {heading}" if heading else title
             for part in split_too_long(body, max_chars - len(header) - 4):
                 content = f"{header}\n\n{part}"[:max_chars]
-                chunks.append((f"mem:{rel}#{index}", content, str(path)))
+                chunks.append((f"{prefix}{rel}#{index}", content, str(path)))
                 index += 1
     return chunks
 
 
-def replace_memory_rows(connection: sqlite3.Connection, chunks: list[tuple[str, str, str]],
-                        entity_type: str = ENTITY_TYPE) -> tuple[int, int]:
-    """Delete previous memory rows and insert these, in one transaction.
+def replace_rows(connection: sqlite3.Connection, chunks: list[tuple[str, str, str]],
+                 prefix: str = MEMORY_CHUNK_PREFIX,
+                 entity_type: str = ENTITY_TYPE) -> tuple[int, int]:
+    """Delete previous rows in this namespace and insert these, in one transaction.
 
     Idempotent by construction: a second run replaces its own output instead of
     doubling every document.
+
+    Deletion is by chunk-id prefix, not by tag.  The tag is a ranking hint the
+    memory rows share with nothing but each other, while an untagged corpus row
+    and an untagged memory row would be indistinguishable - a rebuild that
+    deleted by tag would either take the corpus with it or leave duplicates.
     """
     with connection:  # one transaction, so readers never see a half-built index
         removed = connection.execute(
-            "DELETE FROM chunks WHERE entity_type = ?", (entity_type,)
+            "DELETE FROM chunks WHERE chunk_id LIKE ?", (f"{prefix}%",)
         ).rowcount
         connection.executemany(
             "INSERT INTO chunks (chunk_id, content, source, entity_type) VALUES (?, ?, ?, ?)",
@@ -124,19 +146,20 @@ def replace_memory_rows(connection: sqlite3.Connection, chunks: list[tuple[str, 
     return removed, len(chunks)
 
 
-def index_memory(connection: sqlite3.Connection, root: str | Path | None = None,
-                 max_chars: int = DEFAULT_MAX_CHARS) -> dict:
-    """Index the memory directory; returns statistics, raises on a real failure.
+def index_directory(connection: sqlite3.Connection, root: str | Path,
+                    prefix: str = MEMORY_CHUNK_PREFIX, entity_type: str = ENTITY_TYPE,
+                    max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """Index one directory; returns statistics, raises on a real failure.
 
     A missing directory is not a failure: the router must start even on a machine
-    where the memory directory has not been created yet.
+    where the directory has not been created yet.
     """
-    root = Path(root or MEMORY_DIR)
+    root = Path(root)
     if not root.is_dir():
         return {"root": str(root), "exists": False, "files": 0, "chunks": 0,
                 "chars": 0, "removed": 0, "inserted": 0}
-    chunks = build_chunks(root, max_chars)
-    removed, inserted = replace_memory_rows(connection, chunks)
+    chunks = build_chunks(root, max_chars, prefix)
+    removed, inserted = replace_rows(connection, chunks, prefix, entity_type)
     return {
         "root": str(root),
         "exists": True,
@@ -146,3 +169,23 @@ def index_memory(connection: sqlite3.Connection, root: str | Path | None = None,
         "removed": removed,
         "inserted": inserted,
     }
+
+
+def index_memory(connection: sqlite3.Connection, root: str | Path | None = None,
+                 max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """The working-memory directory: tagged rows, ``mem:`` ids."""
+    return index_directory(connection, Path(root or MEMORY_DIR), MEMORY_CHUNK_PREFIX,
+                           ENTITY_TYPE, max_chars)
+
+
+def index_corpus(connection: sqlite3.Connection, root: str | Path | None = None,
+                 max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """The imported chat corpus: untagged rows, ``gem:`` ids.
+
+    Untagged on purpose - ``entity_type='memory'`` is the input to the FTS5
+    memory boost, and an imported conversation is not the owner's own note.  It
+    is still reachable by the same search, which is the whole point of indexing
+    it into the same table.
+    """
+    return index_directory(connection, Path(root or CORPUS_DIR), CORPUS_CHUNK_PREFIX,
+                           ENTITY_TYPE_CORPUS, max_chars)

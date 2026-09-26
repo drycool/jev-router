@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Add or refresh the memory documents' vectors in storage/jev_vectors.npz.
+"""Add or refresh the vectors of the rows that live only in FTS5.
 
-Incremental by design: the 4562 corpus vectors are read from the archive and
-written back untouched, only the `mem:` rows are re-embedded.  A full rebuild of
-the corpus is the other script's job (`build_vector_index.py`), and it calls the
-same merge at the end so a rebuild cannot quietly drop memory.
+Two namespaces qualify, and they are the two the server indexes at start: the
+working-memory documents (`mem:`) and the imported chat corpus (`gem:`).  The
+file name is historical - the memory documents came first - but the command
+covers both, because a second near-identical script is a second place for the
+dimension check and the corpus-preserving merge to be got wrong.
 
-Idempotent: memory rows are recognised by their `mem:` chunk-id prefix and
-replaced, so running this ten times leaves one copy.  Corpus rows are never
-touched - that is asserted in tests/test_vector_index.py, because losing them
-would empty the index for every corpus query while still looking healthy.
+Incremental by design: the corpus vectors that came from the LightRAG chunk store
+are read from the archive and written back untouched, only the selected
+namespace's rows are re-embedded.  A full rebuild is the other script's job
+(`build_vector_index.py`), and it calls both merges at the end so a rebuild
+cannot quietly drop either namespace.
 
-    python3 scripts/build_memory_vectors.py --dry-run     # no GPU, no write
-    python3 scripts/build_memory_vectors.py               # refresh the archive
+Idempotent: rows are recognised by their chunk-id prefix and replaced, so running
+this ten times leaves one copy.  The other namespace is never touched - that is
+asserted in tests/test_vector_index.py, because losing it would empty the index
+for those queries while still looking healthy.
+
+    python3 scripts/build_memory_vectors.py --dry-run
+    python3 scripts/build_memory_vectors.py --namespace corpus
+    python3 scripts/build_memory_vectors.py --namespace both
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import httpx
 import numpy as np
@@ -30,13 +39,24 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from core.env import load_env  # noqa: E402
+
+# Configuration is read at import time by the modules below, so `.env` has to be
+# applied before they are imported - otherwise this script would embed against
+# the code default while the service embeds against the calibrated value, and
+# the two can differ (JEV_EMBEDDING_API points at the CPU instance here).
+load_env()
+
+from core.memory_index import CORPUS_CHUNK_PREFIX, MEMORY_CHUNK_PREFIX  # noqa: E402
 from core.router import detect_domain  # noqa: E402
 from core.vector_index import (  # noqa: E402
     VectorIndexError,
     corpus_rows,
+    corpus_rows_from_fts5,
     embed_texts,
     load_index,
     memory_rows_from_fts5,
+    merge_corpus,
     merge_memory,
     prune_excluded,
     save_index,
@@ -45,16 +65,24 @@ from core.vector_index import (  # noqa: E402
 DEFAULT_INDEX = PROJECT_ROOT / "storage" / "jev_vectors.npz"
 DEFAULT_DB = PROJECT_ROOT / "storage" / "jev_fts5.db"
 
+# namespace -> (reader of the FTS5 rows, merge into the archive, chunk-id prefix)
+NAMESPACES = {
+    "memory": (memory_rows_from_fts5, merge_memory, MEMORY_CHUNK_PREFIX),
+    "corpus": (corpus_rows_from_fts5, merge_corpus, CORPUS_CHUNK_PREFIX),
+}
+# (namespace, chunks, merge function, chunk-id prefix)
+RowPlan = tuple[str, list[tuple[str, str, str]], Callable[..., tuple[dict, dict]], str]
 
-def report_changes(index: dict, chunks: list[tuple[str, str, str]]) -> int:
-    """How many memory chunks differ from what the archive already holds."""
+
+def report_changes(index: dict, chunks: list[tuple[str, str, str]], prefix: str) -> int:
+    """How many of these chunks differ from what the archive already holds."""
     stored = {
         str(cid): str(content)
         for cid, content in zip(index["chunk_ids"], index["contents"])
-        if str(cid).startswith("mem:")
+        if str(cid).startswith(prefix)
     }
     if not stored:
-        print(f"  archive holds no memory vectors yet: all {len(chunks)} are new")
+        print(f"  archive holds no rows in this namespace yet: all {len(chunks)} are new")
         return len(chunks)
     changed = sum(1 for cid, content, _ in chunks if stored.get(cid) != content)
     missing = sum(1 for cid, _, _ in chunks if cid not in stored)
@@ -64,6 +92,21 @@ def report_changes(index: dict, chunks: list[tuple[str, str, str]]) -> int:
     print(f"  new             : {missing}")
     print(f"  no longer exists: {removed}")
     return changed + missing + removed
+
+
+def selected_namespaces(args: argparse.Namespace) -> list[str]:
+    return ["memory", "corpus"] if args.namespace == "both" else [args.namespace]
+
+
+def read_rows(args: argparse.Namespace, names: list[str]) -> list[RowPlan]:
+    """One entry per namespace with rows to write: (name, chunks, merge, prefix)."""
+    plan = []
+    for name in names:
+        reader, merge, prefix = NAMESPACES[name]
+        chunks = reader(args.db) if args.db.exists() else []
+        print(f"{name:<7}: {len(chunks)} chunks in FTS5")
+        plan.append((name, chunks, merge, prefix))
+    return plan
 
 
 async def build(args: argparse.Namespace) -> int:
@@ -79,7 +122,6 @@ async def build(args: argparse.Namespace) -> int:
     index = load_index(args.index)
     total_before = len(index["chunk_ids"])
     index, prune_stats = prune_excluded(index)
-    chunks = memory_rows_from_fts5(args.db)
     print(f"index   : {args.index}")
     if prune_stats["pruned"]:
         sources = ", ".join(f"{name} x{count}"
@@ -88,9 +130,10 @@ async def build(args: argparse.Namespace) -> int:
               f"({sources}) - JEV_VECTOR_EXCLUDE_SOURCES")
     print(f"  model={index['model']} dimension={index['dimension']} "
           f"rows={len(index['chunk_ids'])} (corpus {corpus_rows(index)})")
-    print(f"memory  : {len(chunks)} chunks from FTS5")
-    if not chunks:
-        print("\nnothing to do: the FTS5 table holds no memory rows")
+
+    plan = read_rows(args, selected_namespaces(args))
+    if not any(chunks for _, chunks, _, _ in plan):
+        print("\nnothing to do: the FTS5 table holds no rows in the selected namespaces")
         return 0
 
     if index["model"] != args.model:
@@ -101,31 +144,33 @@ async def build(args: argparse.Namespace) -> int:
               f"this run would embed with {args.model}", file=sys.stderr)
         return 2
 
-    print("\nchanges against the archive:")
-    report_changes(index, chunks)
-
     timeout = httpx.Timeout(connect=args.connect_timeout, read=args.read_timeout,
                             write=args.read_timeout, pool=args.connect_timeout)
-    started = time.perf_counter()
     async with httpx.AsyncClient(timeout=timeout) as client:
-        embeddings = await embed_texts(client, args.api, args.model,
-                                       [content for _, content, _ in chunks],
-                                       batch_size=args.batch_size)
-    elapsed = time.perf_counter() - started
+        for name, chunks, merge, prefix in plan:
+            if not chunks:
+                continue
+            print(f"\nchanges against the archive ({name}):")
+            report_changes(index, chunks, prefix)
 
-    domains = [detect_domain(f"{source}\n{content}") for _, content, source in chunks]
-    merged, stats = merge_memory(index, chunks, embeddings, domains)
-    save_index(args.index, merged)
+            started = time.perf_counter()
+            embeddings = await embed_texts(client, args.api, args.model,
+                                           [content for _, content, _ in chunks],
+                                           batch_size=args.batch_size)
+            elapsed = time.perf_counter() - started
 
-    print(f"\nembedded {len(chunks)} chunks in {elapsed * 1000:.0f} ms "
-          f"({elapsed * 1000 / len(chunks):.0f} ms/chunk)")
-    print(f"corpus vectors kept   : {stats['corpus']}")
-    print(f"memory rows replaced  : {stats['memory_replaced']}")
-    print(f"memory rows written   : {stats['memory_added']}")
-    print(f"total vectors         : {stats['total']}")
-    print(f"domains               : "
-          f"{json.dumps({d: domains.count(d) for d in sorted(set(domains))})}")
-    print(f"wrote {args.index}")
+            domains = [detect_domain(f"{source}\n{content}") for _, content, source in chunks]
+            index, stats = merge(index, chunks, embeddings, domains)
+            save_index(args.index, index)
+
+            print(f"\nembedded {len(chunks)} chunks in {elapsed * 1000:.0f} ms "
+                  f"({elapsed * 1000 / len(chunks):.0f} ms/chunk)")
+            for key, value in stats.items():
+                print(f"{key:<21}: {value}")
+            print(f"domains              : "
+                  f"{json.dumps({d: domains.count(d) for d in sorted(set(domains))})}")
+
+    print(f"\nwrote {args.index}")
     return 0
 
 
@@ -134,6 +179,8 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--index", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument("--namespace", choices=["memory", "corpus", "both"], default="memory",
+                        help="which FTS5 namespace to refresh (default memory)")
     parser.add_argument("--api", default=os.getenv("JEV_EMBEDDING_API",
                                                    "http://192.168.11.87:11434/api/embed"))
     parser.add_argument("--model", default=os.getenv("JEV_EMBEDDING_MODEL", "bge-m3"))
@@ -157,13 +204,12 @@ def _dry(args: argparse.Namespace) -> int:
         print(f"no vector index at {args.index}", file=sys.stderr)
         return 2
     index = load_index(args.index)
-    chunks = memory_rows_from_fts5(args.db) if args.db.exists() else []
     print(f"index   : {args.index}")
     print(f"  model={index['model']} dimension={index['dimension']} "
           f"rows={len(index['chunk_ids'])} (corpus {corpus_rows(index)})")
-    print(f"memory  : {len(chunks)} chunks in FTS5")
-    print("\nchanges against the archive:")
-    report_changes(index, chunks)
+    for name, chunks, _, prefix in read_rows(args, selected_namespaces(args)):
+        print(f"\nchanges against the archive ({name}):")
+        report_changes(index, chunks, prefix)
     print("\n[dry-run] no embeddings requested, nothing written")
     return 0
 

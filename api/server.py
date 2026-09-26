@@ -50,7 +50,7 @@ from core.router import (
     Strategy,
     fast_path_reason,
 )
-from core.memory_index import MEMORY_DIR, index_memory
+from core.memory_index import CORPUS_DIR, MEMORY_DIR, index_corpus, index_memory
 from core.shadow import ShadowProbe, ShadowTarget
 from agents.base import (
     GeneralAgent, CodeAgent, DBAgent, TroubleshooterAgent,
@@ -291,6 +291,9 @@ async def lifespan(app: FastAPI):
     # Then the working-memory documents.  Order matters: the rebuild above starts
     # with clear(), so anything indexed before it would be deleted immediately.
     await _index_memory_docs()
+    # Then the imported chat corpus, which is indexed the same way and for the
+    # same reason: an answer that lives only in an export is not findable.
+    await _index_corpus_docs()
     # Then pull the embedder into memory while nobody is waiting.  Not awaited:
     # see _warm_embedder for why a start must not block on GPU2.
     global _warmup_task
@@ -423,6 +426,31 @@ async def _index_memory_docs():
               f"(replaced {stats['removed']}, {stats['chars']} chars)")
     except Exception as e:
         print(f"[Jev] memory indexing error: {e}")
+
+
+async def _index_corpus_docs():
+    """Index the imported chat corpus into FTS5 as part of the same rebuild.
+
+    A second directory, the same code path as the memory documents, and the same
+    reason: this table is thrown away and rebuilt on every start, so rows written
+    into it by hand do not survive.  The corpus is what `scripts/
+    import_chat_export.py` wrote from a Takeout export - conversations that exist
+    nowhere else on this machine.
+
+    Separate from the memory step rather than merged into it, because the two
+    directories have different owners and different ids (`gem:` vs `mem:`): one
+    being empty, or deleted, must not affect the other.
+    """
+    try:
+        stats = index_corpus(router.tier2.conn)
+        if not stats["exists"]:
+            print(f"[Jev] corpus directory not found: {stats['root']} (skipped)")
+            return
+        print(f"[Jev] Indexed {stats['inserted']} chat-corpus chunks from "
+              f"{stats['files']} files in {stats['root']} "
+              f"(replaced {stats['removed']}, {stats['chars']} chars)")
+    except Exception as e:
+        print(f"[Jev] corpus indexing error: {e}")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────
