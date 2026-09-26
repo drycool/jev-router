@@ -47,11 +47,19 @@ CORPUS_DIR = os.getenv("JEV_CORPUS_DIR", DEFAULT_CHATS_DIR)
 # Written by `jev-collect` (Go): the documentation and commit history of the
 # repositories on this machine, and later GitHub and the agent's own sessions.
 DEFAULT_PROJECTS_DIR = "/home/dry/LightRag/feeds/projects"
+# Also `jev-collect`, a different source: what exists only on GitHub - the README
+# and commit history of the repositories with no local clone here, plus issues,
+# pull requests and releases, which a clone never carries.  A repository that does
+# have a clone keeps its README and history in `projects` only: one text under two
+# identities dilutes retrieval, because the two chunks compete and the winner is a
+# coin toss.
+DEFAULT_GITHUB_DIR = "/home/dry/LightRag/feeds/github"
 ENTITY_TYPE = "memory"
 ENTITY_TYPE_CORPUS = ""
 MEMORY_CHUNK_PREFIX = "mem:"
 CORPUS_CHUNK_PREFIX = "gem:"
 PROJECT_CHUNK_PREFIX = "prj:"
+GITHUB_CHUNK_PREFIX = "gh:"
 # The server indexes LightRAG chunks at 2000 characters; staying under that keeps
 # one document from being penalised relative to another by the BM25 length norm.
 DEFAULT_MAX_CHARS = 1800
@@ -67,6 +75,8 @@ FEED_SPECS: tuple[tuple[str, str, str, str, str], ...] = (
      CORPUS_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
     ("projects", "JEV_PROJECTS_DIR", DEFAULT_PROJECTS_DIR,
      PROJECT_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
+    ("github", "JEV_GITHUB_DIR", DEFAULT_GITHUB_DIR,
+     GITHUB_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
 )
 
 

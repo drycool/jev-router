@@ -23,10 +23,12 @@ from unittest.mock import patch
 import numpy as np
 
 from core.memory_index import (
+    DEFAULT_GITHUB_DIR,
     DEFAULT_PROJECTS_DIR,
     ENTITY_TYPE,
     ENTITY_TYPE_CORPUS,
     FEED_SPECS,
+    GITHUB_CHUNK_PREFIX,
     MEMORY_CHUNK_PREFIX,
     PROJECT_CHUNK_PREFIX,
     build_chunks,
@@ -76,9 +78,21 @@ class RegistryTests(unittest.TestCase):
                          "a project's README is material, not the owner's own note")
 
     def test_an_unknown_feed_names_the_known_ones(self):
+        # «github» был примером фида, которого ещё нет, пока его не построили —
+        # и тест упал ровно тогда, когда он появился, что и должен был сделать.
         with self.assertRaises(ValueError) as caught:
-            feed("github")
+            feed("нет-такого-фида")
         self.assertIn("projects", str(caught.exception))
+        self.assertIn("github", str(caught.exception))
+
+    def test_the_github_feed_points_at_the_collector_output(self):
+        """Второй источник того же сборщика: то, чего нет в локальном клоне."""
+        self.assertEqual(feed("github").directory, DEFAULT_GITHUB_DIR)
+        self.assertEqual(feed("github").prefix, GITHUB_CHUNK_PREFIX)
+        self.assertEqual(feed("github").entity_type, ENTITY_TYPE_CORPUS,
+                         "README репозитория — материал, а не заметка владельца")
+        self.assertNotEqual(feed("github").directory, feed("projects").directory,
+                            "два фида в одном каталоге перезаписывали бы документы друг друга")
 
     def test_a_directory_can_be_moved_without_reloading_the_module(self):
         """The registry is read per call: a test (or an operator) that points a
