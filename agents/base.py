@@ -47,6 +47,55 @@ def _llm_timeout() -> httpx.Timeout:
     )
 
 
+# Reasoning on or off for the local model.
+#
+# `ornith-1.5-9b-256k` reasons *into the answer field*: ollama returns no separate `thinking`
+# key for it, so the reasoning cannot be filtered out after the fact - it arrives as the
+# answer. Measured on the acceptance question, `response` was 1918 characters beginning "The
+# user is asking about how user-level systemd services are configured. Let me analyze the
+# context provided." A consumer that asked how the services are configured received a
+# monologue about the question instead of the answer to it.
+#
+# With `"think": false` the same prompt returned a Russian answer instead: "## Настройка
+# пользовательских systemd-сервисов ... Размещение юнита ...", 1434 characters, in 7.5 s,
+# and ollama reported the same `done_reason: stop`.
+#
+# Deliberately NOT paired with a smaller `num_predict`. Measured at 512, `eval_count` came
+# back as exactly 512 - the ANSWER was cut off mid-sentence. Once thinking is off the token
+# cap bounds the answer rather than the reasoning, so lowering it truncates the only part
+# worth keeping.
+#
+# Default false because every caller of this module answers from local material. Work that
+# genuinely needs reasoning should opt in per call, not leave it on for every lookup.
+LLM_THINK = os.getenv("JEV_LLM_THINK", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _generate(host: str, model: str, prompt: str, on_error: str) -> str:
+    """The one place an agent talks to the model.
+
+    This was four copies of the same httpx call with the same payload, which is why the
+    reasoning switch would have had to be added in four places to have any effect, and why
+    "does the agent disable thinking?" had four answers instead of one. Any decision about
+    the shape of the request - model, options, reasoning - belongs here and nowhere else.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_llm_timeout()) as client:
+            resp = await client.post(
+                f"{host}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "think": LLM_THINK,
+                    "options": {"num_ctx": 16384, "num_predict": 4096},
+                },
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+    except Exception as e:
+        return f"{on_error}: {e}"
+
+
 # ── Base Agent ────────────────────────────────────────────────────────
 @dataclass
 class AgentResponse:
@@ -91,6 +140,7 @@ class GeneralAgent(BaseAgent):
 
         prompt = f"""Ты — AI-ассистент. Отвечай на основе предоставленного контекста.
 Если контекста недостаточно, скажи об этом.
+Отвечай сразу готовым ответом: не описывай, что ты собираешься делать, и не рассуждай вслух.
 
 КОНТЕКСТ:
 {_clip_context(context) if context else 'Контекст не найден.'}
@@ -99,21 +149,7 @@ class GeneralAgent(BaseAgent):
 
 ОТВЕТ:"""
 
-        try:
-            async with httpx.AsyncClient(timeout=_llm_timeout()) as client:
-                resp = await client.post(
-                    f"{self.llm_host}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_ctx": 16384, "num_predict": 4096},
-                    },
-                )
-                resp.raise_for_status()
-                answer = resp.json().get("response", "")
-        except Exception as e:
-            answer = f"Ошибка LLM: {e}"
+        answer = await _generate(self.llm_host, self.model, prompt, "Ошибка LLM")
 
         return AgentResponse(
             agent=self.name,
@@ -147,21 +183,7 @@ class CodeAgent(BaseAgent):
 
 КОД/ОТВЕТ:"""
 
-        try:
-            async with httpx.AsyncClient(timeout=_llm_timeout()) as client:
-                resp = await client.post(
-                    f"{self.llm_host}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_ctx": 16384, "num_predict": 4096},
-                    },
-                )
-                resp.raise_for_status()
-                answer = resp.json().get("response", "")
-        except Exception as e:
-            answer = f"Ошибка генерации кода: {e}"
+        answer = await _generate(self.llm_host, self.model, prompt, "Ошибка генерации кода")
 
         return AgentResponse(
             agent=self.name,
@@ -195,21 +217,7 @@ class DBAgent(BaseAgent):
 
 SQL/ОТВЕТ:"""
 
-        try:
-            async with httpx.AsyncClient(timeout=_llm_timeout()) as client:
-                resp = await client.post(
-                    f"{self.llm_host}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_ctx": 16384, "num_predict": 4096},
-                    },
-                )
-                resp.raise_for_status()
-                answer = resp.json().get("response", "")
-        except Exception as e:
-            answer = f"Ошибка БД агента: {e}"
+        answer = await _generate(self.llm_host, self.model, prompt, "Ошибка БД агента")
 
         return AgentResponse(
             agent=self.name,
@@ -243,21 +251,7 @@ class TroubleshooterAgent(BaseAgent):
 
 АНАЛИЗ:"""
 
-        try:
-            async with httpx.AsyncClient(timeout=_llm_timeout()) as client:
-                resp = await client.post(
-                    f"{self.llm_host}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_ctx": 16384, "num_predict": 4096},
-                    },
-                )
-                resp.raise_for_status()
-                answer = resp.json().get("response", "")
-        except Exception as e:
-            answer = f"Ошибка troubleshooter: {e}"
+        answer = await _generate(self.llm_host, self.model, prompt, "Ошибка troubleshooter")
 
         return AgentResponse(
             agent=self.name,

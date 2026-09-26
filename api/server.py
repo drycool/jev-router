@@ -48,6 +48,7 @@ from core.router import (
     LIGHTRAG_ENABLED,
     RoutingResult,
     Strategy,
+    fast_path_reason,
 )
 from core.memory_index import MEMORY_DIR, index_memory
 from core.shadow import ShadowProbe, ShadowTarget
@@ -487,6 +488,12 @@ class StatsResponse(BaseModel):
     tier3_hits: int
     degraded_requests: int
     agent_errors: int
+    # Requests answered from local material without tier 4, and which kind of material
+    # earned each exit. The per-strategy breakdown is the one that matters: a total would
+    # leave "the fast path fired" and "the fast path is firing for the wrong reason"
+    # indistinguishable in the only place a regression could be seen.
+    fast_path_exits: int
+    fast_path_exits_by_strategy: dict[str, int]
     laya_predictions: int
     laya_accepted: int
     laya_not_awaited: int
@@ -548,6 +555,8 @@ _stats = {
     "total_ms": 0.0,
     "degraded": 0,
     "agent_errors": 0,
+    "fast_path_exits": 0,
+    "fast_path_exits_by_strategy": {},
     "laya_predictions": 0,
     "laya_accepted": 0,
     "laya_not_awaited": 0,
@@ -618,6 +627,28 @@ def _tier_of(strategy: Strategy) -> str:
     return _TIER_OF.get(strategy.value, "unknown")
 
 
+def _direct_answer(result: RoutingResult) -> str:
+    """The answer the local tiers already hold, with its sources.
+
+    This is what a fast-path exit returns instead of a synthesised answer. It is the
+    retrieved material verbatim plus where it came from - deliberately not a summary,
+    because summarising requires the model this path exists to avoid, and because the
+    material is what a consumer can verify.
+
+    The source footer is not decoration: on this path the text IS the answer, and an answer
+    about a project that does not say which file it came from cannot be checked against the
+    file. `agent_response` carried no source on any path before this.
+    """
+    context = (result.context or "").strip()
+    if not context:
+        return ""
+    sources = result.context_stats.get("sources") or []
+    if not sources:
+        return context
+    listing = "\n".join(f"  - {source}" for source in sources)
+    return f"{context}\n\n── Источник ({len(sources)}):\n{listing}"
+
+
 def _record_decision(
     query: str,
     result: RoutingResult,
@@ -626,6 +657,7 @@ def _record_decision(
     decision_id: str,
     agent_response: str = "",
     execute: bool = True,
+    fast_path: "str | None" = None,
 ) -> None:
     """Write one privacy-preserving JSONL event for later evaluation/ML labels.
 
@@ -674,6 +706,15 @@ def _record_decision(
             "lightrag_required": result.rag_configuration.lightrag_required,
             "lightrag_mode": result.rag_configuration.lightrag_mode,
             "execute_requested": execute,
+            # What the caller asked for versus what happened, side by side, because the
+            # difference is the whole point: every caller sends execute=true, and until this
+            # field existed there was no way to tell a request that needed the LLM from one
+            # whose answer was already in hand. A reader can now see "the caller wanted an
+            # agent and got the corpus instead, because of fts_exact_high_confidence".
+            "fast_path_exit": fast_path is not None,
+            "fast_path_reason": fast_path,
+            # Provenance for a fast-path answer, which is the material itself.
+            "context_sources": result.context_stats.get("sources") or [],
         },
         "execution": {
             "latency_ms": round(elapsed_ms, 2),
@@ -773,10 +814,36 @@ async def query(req: QueryRequest):
             if _laya_accepted(result):
                 _stats["laya_accepted"] += 1
 
-    # Tier 4: Execute agent if requested
+    # Tier 4: execute the agent - unless the local tiers already answered.
+    #
+    # The caller's `execute` says it wants an answer, not that it wants the LLM: it cannot
+    # know what routing decided, and until now it was the only voice in this decision, so
+    # every request paid tier 4 even when retrieval had already put the answer text in the
+    # context. Measured on the acceptance question: `exact_fts` 0.95, 1209 characters of
+    # on-point material, 166 ms - and 12617 ms through the model, which returned its
+    # reasoning about the question rather than the answer to it.
+    #
+    # A fast-path exit is only taken when the caller asked for an answer at all: with
+    # `execute=false` the caller wants the routing decision and the context, and handing it
+    # prose would break the contract the MCP tool is built on.
     agent_response = ""
     agent_error = False
-    if req.execute:
+    fast_path = fast_path_reason(result.routing_decision) if req.execute else None
+    if fast_path:
+        agent_response = _direct_answer(result)
+        if not agent_response:
+            # Decisive by status, but the context is empty - so the exit would return an
+            # empty answer while a model was available to say something. The status is a
+            # claim about the corpus, not a promise that this request carries material;
+            # when the two disagree, the material wins and the request takes the slow path.
+            fast_path = None
+    if fast_path:
+        strategy_name = result.routing_decision.strategy.value
+        _stats["fast_path_exits"] += 1
+        _stats["fast_path_exits_by_strategy"][strategy_name] = (
+            _stats["fast_path_exits_by_strategy"].get(strategy_name, 0) + 1
+        )
+    elif req.execute:
         try:
             resp: AgentResponse = await router.tier4.execute(result)
             agent_response = resp.answer
@@ -795,6 +862,7 @@ async def query(req: QueryRequest):
         decision_id=decision_id,
         agent_response=agent_response,
         execute=req.execute,
+        fast_path=fast_path,
     )
 
     return QueryResponse(
@@ -802,7 +870,13 @@ async def query(req: QueryRequest):
         routing_decision={
             "strategy": result.routing_decision.strategy.value,
             "confidence_score": result.routing_decision.confidence_score,
-            "fast_path_exit": result.routing_decision.fast_path_exit,
+            # The request-level outcome, not tier 1's internal signal (that one is
+            # `tier1_exit`; /route-only reports both side by side): true means this request
+            # was answered from local material without calling the model at all.
+            "fast_path_exit": fast_path is not None,
+            # Names which kind of material earned the exit, so a consumer can tell an exact
+            # literal match from a semantic one without re-deriving it from the strategy.
+            "fast_path_reason": fast_path,
             # The one bit a consumer needs to decide whether it may state facts about the
             # project. Derived from the strategy, so it cannot disagree with it.
             "local_material_decisive": result.routing_decision.local_material_decisive,
@@ -885,6 +959,8 @@ async def stats():
         tier3_hits=_stats["tier3"],
         degraded_requests=_stats["degraded"],
         agent_errors=_stats["agent_errors"],
+        fast_path_exits=_stats["fast_path_exits"],
+        fast_path_exits_by_strategy=dict(_stats["fast_path_exits_by_strategy"]),
         laya_predictions=_stats["laya_predictions"],
         laya_accepted=_stats["laya_accepted"],
         laya_not_awaited=_stats["laya_not_awaited"],
@@ -918,6 +994,19 @@ async def metrics():
         f'jev_degraded_requests_total {_stats["degraded"]}',
         "# TYPE jev_agent_errors_total counter",
         f'jev_agent_errors_total {_stats["agent_errors"]}',
+        "# TYPE jev_fast_path_exits_total counter",
+        # Any exit not attributed to a strategy. It should always be zero; it is exposed so
+        # that a future exit path which forgets to record one shows up as a series rather
+        # than as a total that quietly disagrees with its own breakdown.
+        f'jev_fast_path_exits_total{{strategy="unrecorded"}} '
+        f'{_stats["fast_path_exits"] - sum(_stats["fast_path_exits_by_strategy"].values())}',
+    ]
+    # One series per strategy that has actually earned an exit. Emitting the zero series for
+    # all eight statuses would be noise, and emitting none for a strategy that fired would
+    # hide it; this way the label set grows with real behaviour only.
+    for _strategy_name, _count in sorted(_stats["fast_path_exits_by_strategy"].items()):
+        lines.append(f'jev_fast_path_exits_total{{strategy="{_strategy_name}"}} {_count}')
+    lines += [
         "# TYPE jev_laya_predictions_total counter",
         f'jev_laya_predictions_total {_stats["laya_predictions"]}',
         "# TYPE jev_laya_accepted_total counter",
@@ -963,11 +1052,20 @@ async def metrics():
 async def route_only(query: str = Query(..., min_length=1, max_length=16000)):
     """Route without executing agent (diagnostic mode)."""
     result = await router.route(query)
+    # Reported rather than inferred: this endpoint exists so that the decision to skip the
+    # model can be inspected without paying for the request, and "would /query have called
+    # the LLM for this?" is the question it is actually asked.
+    fast_path = fast_path_reason(result.routing_decision)
     return {
         "routing_decision": {
             "strategy": result.routing_decision.strategy.value,
             "confidence_score": result.routing_decision.confidence_score,
-            "fast_path_exit": result.routing_decision.fast_path_exit,
+            # Both meanings, named separately, because they are not the same claim and the
+            # diagnostic endpoint is where the difference is visible: what tier 1 concluded
+            # on its own, and whether /query would skip the model for this request.
+            "tier1_exit": result.routing_decision.tier1_exit,
+            "fast_path_exit": fast_path is not None,
+            "fast_path_reason": fast_path,
             # The one bit a consumer needs to decide whether it may state facts about the
             # project. Derived from the strategy, so it cannot disagree with it.
             "local_material_decisive": result.routing_decision.local_material_decisive,

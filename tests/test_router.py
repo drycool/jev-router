@@ -745,7 +745,7 @@ class LocalMaterialDecisiveTests(unittest.TestCase):
         for strategy in Strategy:
             with self.subTest(strategy=strategy):
                 decision = RoutingDecision(strategy=strategy, confidence_score=0.9,
-                                           fast_path_exit=False)
+                                           tier1_exit=False)
                 self.assertEqual(decision.local_material_decisive, strategy in decisive)
 
     def test_a_high_confidence_weak_pool_does_not_become_decisive(self):
@@ -756,7 +756,7 @@ class LocalMaterialDecisiveTests(unittest.TestCase):
         better than it is.  The flag follows the status, not the number.
         """
         weak = RoutingDecision(strategy=Strategy.FTS_FALLBACK, confidence_score=0.99,
-                               fast_path_exit=False)
+                               tier1_exit=False)
         self.assertFalse(weak.local_material_decisive)
 
     def test_a_failed_retriever_does_not_deny_the_corpus(self):
@@ -767,7 +767,7 @@ class LocalMaterialDecisiveTests(unittest.TestCase):
         request would be caught here rather than in an agent's answer.
         """
         degraded = RoutingDecision(strategy=Strategy.EMBEDDING_TIMEOUT, confidence_score=0.0,
-                                   fast_path_exit=False)
+                                   tier1_exit=False)
         self.assertFalse(degraded.local_material_decisive)
 
 

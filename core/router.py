@@ -24,7 +24,18 @@ from core.vector_index import is_excluded_source
 
 # ── Configuration ──────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SIMILARITY_THRESHOLD = float(os.getenv("JEV_SIMILARITY_THRESHOLD", "0.80"))
+# The bar a semantic match must clear to be called decisive.
+#
+# 0.80 was the value calibrated for mxbai-embed-large and it is **above every decisive hit
+# this corpus produces**: bge-m3 compresses related pairs to 0.55-0.67, so the measured
+# decisions are 0.5574-0.6721 and the vector tier would return nothing on 0.80. The
+# production value has been 0.45 since the model changed (`.env`), which made this default a
+# divergence rather than a fallback: the tests do not load `.env`, so the whole vector tier
+# was exercised at 0.80 in the suite and 0.45 in production, and no test could have noticed
+# a regression at the real bar. Same class of defect as the code defaults that disagreed
+# with `.env` on the embedding budget - a default is a second opinion, and it must not be a
+# different one.
+SIMILARITY_THRESHOLD = float(os.getenv("JEV_SIMILARITY_THRESHOLD", "0.45"))
 FTS5_DB_PATH = os.getenv("JEV_FTS5_DB_PATH", str(PROJECT_ROOT / "storage" / "jev_fts5.db"))
 VECTOR_DB_PATH = os.getenv("JEV_VECTOR_DB_PATH", str(PROJECT_ROOT / "storage" / "jev_vectors.npz"))
 LIGHTRAG_API = os.getenv("JEV_LIGHTRAG_API", "http://localhost:8020")
@@ -245,7 +256,13 @@ class LightRAGMode(str, Enum):
 class RoutingDecision:
     strategy: Strategy
     confidence_score: float
-    fast_path_exit: bool
+    # Tier 1's own exit signal: "this is an action or a code task, not a question for the
+    # corpus". That is a different claim from "this request was answered without the LLM",
+    # which the server decides and which tier 2 can also earn. The field used to be called
+    # `fast_path_exit` and the two claims collided in one name: a response could report
+    # `fast_path_exit: false` on a request that had in fact skipped the LLM, and the
+    # opposite. What tier 1 concluded is now called what it is.
+    tier1_exit: bool
 
     @property
     def local_material_decisive(self) -> bool:
@@ -265,6 +282,74 @@ class RoutingDecision:
         parked graph tier, and direct_action - a command is not local material.
         """
         return self.strategy in (Strategy.EXACT_FTS, Strategy.VECTOR_FAST)
+
+
+# ── Fast path: answering without the LLM ──────────────────────────────
+#
+# The local tiers already return the answer text, not a pointer to it. When they return it
+# decisively, sending that text through a 9B model to be rephrased costs seconds and can
+# only lose information - and it was measured doing exactly that: the acceptance question
+# came back as `exact_fts` 0.95 with 1209 characters of on-point context after 166 ms, and
+# the same request through tier 4 took **12617 ms** and returned 2375 characters beginning
+# "The question is in Russian... Let me base my answer on the provided context." The
+# consumer paid 76x the latency to receive the model's reasoning about the question instead
+# of the answer to it.
+#
+# So the material itself is the fast-path condition, and the reason names which kind of
+# material earned the exit - the same discipline as everywhere else on this branch, because
+# "the LLM was skipped" has more than one cause and a consumer deciding how far to trust an
+# answer needs to know which one it got.
+FAST_PATH_FTS_MIN = float(os.getenv("JEV_FAST_PATH_FTS_MIN", "0.90"))
+# The vector bar is the tier's own decisive boundary rather than a second, higher number.
+# A 0.90 here would be **unreachable**: bge-m3 compresses related pairs to 0.55-0.67 on this
+# corpus, so every measured decisive hit (0.5574-0.6721) sits below it and the vector fast
+# path would be dead code that passes its tests. This is the same trap as the 0.80
+# similarity threshold calibrated for a different model - the number was plausible and the
+# geometry disagreed.
+FAST_PATH_VECTOR_MIN = float(os.getenv("JEV_FAST_PATH_VECTOR_MIN", str(SIMILARITY_THRESHOLD)))
+
+FAST_PATH_REASON_FTS = "fts_exact_high_confidence"
+FAST_PATH_REASON_VECTOR = "vector_decisive_similarity"
+
+# Every strategy either earns a fast-path exit or is listed here as earning none. Written as
+# a total function over the enum so that a strategy added later cannot silently inherit an
+# exit - the defect this branch already shipped once, when a tier map's default made two
+# different fallbacks look like LLM answers.
+FAST_PATH_NO_EXIT: frozenset[Strategy] = frozenset({
+    Strategy.DIRECT_ACTION,        # an action, not a question; nothing to answer (see below)
+    Strategy.GRAPH_LIGHTRAG,       # parked; and a graph answer is composed, not retrieved
+    Strategy.GENERAL_LLM,          # nothing local: the LLM is the only source
+    Strategy.FTS_FALLBACK,         # rows found, gate refused: hypothesis only
+    Strategy.VECTOR_LOW_CONFIDENCE,  # neighbours existed, none cleared the bar
+    Strategy.EMBEDDING_TIMEOUT,    # the retriever did not answer: no corpus conclusion
+})
+
+
+def fast_path_reason(decision: RoutingDecision) -> Optional[str]:
+    """Why this request can be answered without tier 4, or None if it cannot.
+
+    Deliberately computed from `local_material_decisive` rather than repeating the strategy
+    list: the bit and the exit must not be able to disagree, and they are the same claim
+    about the corpus at two levels of detail.
+
+    `direct_action` does not earn an exit here even though tier 1 marks it `tier1_exit`.
+    Tier 1 is right that no corpus answer exists for a command, but the alternative to the
+    LLM is not "return the context" - there is no context - it is a product decision about
+    what a command should return, and silently changing what the field tool gets back for
+    command-shaped queries is not a decision this function should make.
+    """
+    if not decision.local_material_decisive:
+        return None
+    if decision.strategy is Strategy.EXACT_FTS:
+        # The FTS gate reports a fixed 0.95 when it accepts, so this bar is a formality
+        # today and exists so that a future confidence has somewhere to land.
+        return FAST_PATH_REASON_FTS if decision.confidence_score >= FAST_PATH_FTS_MIN else None
+    return FAST_PATH_REASON_VECTOR if decision.confidence_score >= FAST_PATH_VECTOR_MIN else None
+
+
+def fast_path_exit(decision: RoutingDecision) -> bool:
+    """Whether a request with this decision is answered without tier 4."""
+    return fast_path_reason(decision) is not None
 
 
 @dataclass
@@ -386,7 +471,7 @@ def tier1_fast_route(query: str) -> Optional[RoutingResult]:
                 routing_decision=RoutingDecision(
                     strategy=Strategy.DIRECT_ACTION,
                     confidence_score=1.0,
-                    fast_path_exit=True,
+                    tier1_exit=True,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent="binary_decision",
@@ -405,7 +490,7 @@ def tier1_fast_route(query: str) -> Optional[RoutingResult]:
                 routing_decision=RoutingDecision(
                     strategy=Strategy.DIRECT_ACTION,
                     confidence_score=0.95,
-                    fast_path_exit=True,
+                    tier1_exit=True,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent=intent,
@@ -425,7 +510,7 @@ def tier1_fast_route(query: str) -> Optional[RoutingResult]:
             routing_decision=RoutingDecision(
                 strategy=Strategy.DIRECT_ACTION,
                 confidence_score=0.85,
-                fast_path_exit=True,
+                tier1_exit=True,
             ),
             extracted_metadata=ExtractedMetadata(
                 intent="code_execution",
@@ -598,6 +683,7 @@ def assemble_context(results: list[dict], budget: Optional[int] = None) -> tuple
     used = 0
     duplicates = 0
     too_large = 0
+    sources: list[str] = []
 
     for result in results:
         content = (result.get("content") or "").strip()
@@ -617,6 +703,13 @@ def assemble_context(results: list[dict], budget: Optional[int] = None) -> tuple
 
         parts.append(content)
         used += separator + len(content)
+        # Provenance for the chunks that actually made it in, in the order they were used.
+        # Recorded because on the fast path this text IS the answer: a consumer that gets
+        # the material instead of a written answer has to be able to say where it came from,
+        # and until now the response carried no source at all.
+        source = str(result.get("source") or "")
+        if source and source not in sources:
+            sources.append(source)
 
     context = CONTEXT_SEPARATOR.join(parts)
     stats = {
@@ -629,6 +722,7 @@ def assemble_context(results: list[dict], budget: Optional[int] = None) -> tuple
         # True when a unique chunk was dropped for size, i.e. the budget - not the
         # retrieval pool - was the binding constraint.
         "budget_exhausted": too_large > 0,
+        "sources": sources,
     }
     return context, stats
 
@@ -1034,7 +1128,7 @@ class JevRouter:
                 routing_decision=RoutingDecision(
                     strategy=Strategy.EXACT_FTS,
                     confidence_score=0.95,
-                    fast_path_exit=False,
+                    tier1_exit=False,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent="exact_search",
@@ -1126,7 +1220,7 @@ class JevRouter:
                 routing_decision=RoutingDecision(
                     strategy=Strategy.VECTOR_FAST,
                     confidence_score=best_score,
-                    fast_path_exit=False,
+                    tier1_exit=False,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent="vector_search",
@@ -1232,7 +1326,7 @@ class JevRouter:
                 routing_decision=RoutingDecision(
                     strategy=strategy,
                     confidence_score=confidence,
-                    fast_path_exit=False,
+                    tier1_exit=False,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent=intent,
@@ -1275,7 +1369,7 @@ class JevRouter:
             routing_decision=RoutingDecision(
                 strategy=Strategy.GRAPH_LIGHTRAG,
                 confidence_score=0.7,
-                fast_path_exit=False,
+                tier1_exit=False,
             ),
             extracted_metadata=ExtractedMetadata(
                 intent="graph_search",

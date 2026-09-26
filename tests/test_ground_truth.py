@@ -64,7 +64,7 @@ class CapturedLogs:
 def make_result(strategy=Strategy.EXACT_FTS, context="", **kwargs):
     return RoutingResult(
         routing_decision=RoutingDecision(
-            strategy=strategy, confidence_score=0.95, fast_path_exit=False
+            strategy=strategy, confidence_score=0.95, tier1_exit=False
         ),
         extracted_metadata=ExtractedMetadata(
             intent="exact_search", keywords=["момент"], domain="general"
