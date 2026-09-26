@@ -56,6 +56,7 @@ from core.vector_index import (  # noqa: E402
     load_index,
     memory_rows_from_fts5,
     merge_namespace,
+    reusable_embeddings,
     prune_excluded,
     rows_from_fts5,
     save_index,
@@ -186,10 +187,19 @@ async def build(args: argparse.Namespace) -> int:
             print(f"\nchanges against the archive ({name}):")
             report_changes(index, chunks, prefix)
 
+            # Only what changed goes to the embedder.  A daily refresh of a feed with
+            # fifteen changed rows must not pay for two and a half thousand unchanged
+            # ones: on this host the embedder is a model on another machine that sleeps.
+            embeddings, needs = reusable_embeddings(index, chunks, prefix)
+            fresh = int(needs.sum())
+            print(f"  to embed       : {fresh} rows, {len(chunks) - fresh} reused")
             started = time.perf_counter()
-            embeddings = await embed_texts(client, args.api, args.model,
-                                           [content for _, content, _ in chunks],
-                                           batch_size=args.batch_size)
+            if fresh:
+                new_rows = await embed_texts(
+                    client, args.api, args.model,
+                    [content for row, (_, content, _) in enumerate(chunks) if needs[row]],
+                    batch_size=args.batch_size)
+                embeddings[needs] = np.asarray(new_rows, dtype=np.float32)
             elapsed = time.perf_counter() - started
 
             domains = [detect_domain(f"{source}\n{content}") for _, content, source in chunks]

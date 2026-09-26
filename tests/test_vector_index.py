@@ -19,6 +19,7 @@ import numpy as np
 from core.router import EMBEDDING_MODEL, Tier2Search
 from core.vector_index import (
     ENTITY_MEMORY,
+    reusable_embeddings,
     EXCLUDED_SOURCE_MARKERS,
     VectorIndexError,
     corpus_rows,
@@ -249,3 +250,85 @@ class RouterVectorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReusableEmbeddingsTest(unittest.TestCase):
+    """Incremental embedding: the daily refresh must not re-embed what it already has.
+
+    Measured on this host: a feed of 2620 chunks with 15 changed ones costs the embedder's
+    whole pass (1 m 47 s) if nothing is reused, and the embedder is a model on another
+    machine that sleeps by default.  The rules below are what makes the difference between
+    a schedule that runs unattended and one that wakes a GPU to recompute identical rows.
+    """
+
+    def index(self, rows):
+        return {
+            "model": EMBEDDING_MODEL,
+            "dimension": 3,
+            "chunk_ids": [row[0] for row in rows],
+            "contents": [row[1] for row in rows],
+            "sources": [row[2] for row in rows],
+            "domains": ["general"] * len(rows),
+            "entity_types": ["memory"] * len(rows),
+            "embeddings": np.asarray([row[3] for row in rows], dtype=np.float32),
+        }
+
+    def test_an_unchanged_chunk_keeps_its_stored_vector(self):
+        stored = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
+        index = self.index([("mem:a#1", "текст", "/m/a.md", [1.0, 2.0, 3.0])])
+        embeddings, needs = reusable_embeddings(index, [("mem:a#1", "текст", "/m/a.md")], "mem:")
+        self.assertFalse(bool(needs[0]))
+        np.testing.assert_array_equal(embeddings[0], stored[0])
+
+    def test_changed_text_is_not_reused(self):
+        index = self.index([("mem:a#1", "старый текст", "/m/a.md", [1.0, 2.0, 3.0])])
+        embeddings, needs = reusable_embeddings(index, [("mem:a#1", "новый текст", "/m/a.md")], "mem:")
+        self.assertTrue(bool(needs[0]))
+        # Zeroed rather than stale: a caller that ignored the mask must embed, not reuse.
+        np.testing.assert_array_equal(embeddings[0], np.zeros(3, dtype=np.float32))
+
+    def test_a_new_chunk_is_not_reused(self):
+        index = self.index([("mem:a#1", "текст", "/m/a.md", [1.0, 2.0, 3.0])])
+        chunks = [("mem:a#1", "текст", "/m/a.md"), ("mem:b#1", "ещё", "/m/b.md")]
+        embeddings, needs = reusable_embeddings(index, chunks, "mem:")
+        self.assertEqual(list(needs), [False, True])
+
+    def test_a_vector_of_another_feed_is_not_visible(self):
+        """Namespaces stay separate: a `prj:` row must not answer for a `mem:` chunk."""
+        index = self.index([("mem:a#1", "текст", "/m/a.md", [1.0, 2.0, 3.0])])
+        embeddings, needs = reusable_embeddings(index, [("prj:a#1", "текст", "/p/a.md")], "prj:")
+        self.assertTrue(bool(needs[0]))
+        np.testing.assert_array_equal(embeddings[0], np.zeros(3, dtype=np.float32))
+
+    def test_a_changed_source_does_not_force_a_recompute(self):
+        # Reuse is by text: the caller's source is what gets written, so a document that
+        # moved must not cost an embedding of text that did not change.
+        index = self.index([("mem:a#1", "текст", "/old/a.md", [1.0, 2.0, 3.0])])
+        _embeddings, needs = reusable_embeddings(index, [("mem:a#1", "текст", "/new/a.md")], "mem:")
+        self.assertFalse(bool(needs[0]))
+
+    def test_the_caller_order_decides_which_row_gets_which_vector(self):
+        index = self.index([("mem:a#1", "a", "/m/a.md", [1.0, 0.0, 0.0]),
+                            ("mem:b#1", "b", "/m/b.md", [0.0, 1.0, 0.0])])
+        chunks = [("mem:b#1", "b", "/m/b.md"), ("mem:a#1", "a", "/m/a.md")]
+        embeddings, needs = reusable_embeddings(index, chunks, "mem:")
+        self.assertEqual(list(needs), [False, False])
+        np.testing.assert_array_equal(embeddings[0], np.asarray([0.0, 1.0, 0.0], dtype=np.float32))
+        np.testing.assert_array_equal(embeddings[1], np.asarray([1.0, 0.0, 0.0], dtype=np.float32))
+
+    def test_an_archive_without_a_dimension_reuses_nothing(self):
+        # An archive that never had vectors cannot be indexed against; the caller has to
+        # build it from scratch, and a zero-width matrix makes that obvious instead of
+        # returning rows that would fail the merge's shape check later.
+        embeddings, needs = reusable_embeddings({}, [("mem:a#1", "a", "/m/a.md")], "mem:")
+        self.assertEqual(embeddings.shape, (1, 0))
+        self.assertTrue(bool(needs[0]))
+
+    def test_a_stored_vector_of_the_wrong_width_is_not_reused(self):
+        index = self.index([("mem:a#1", "текст", "/m/a.md", [1.0, 2.0, 3.0])])
+        # A rectangular archive cannot hold a short row, so this is what a hand-edited or
+        # half-migrated npz looks like: it declares dimension=3 and ships a 2-wide matrix.
+        index["embeddings"] = np.asarray([[1.0, 2.0]], dtype=np.float32)
+        embeddings, needs = reusable_embeddings(index, [("mem:a#1", "текст", "/m/a.md")], "mem:")
+        self.assertTrue(bool(needs[0]))
+        np.testing.assert_array_equal(embeddings[0], np.zeros(3, dtype=np.float32))
