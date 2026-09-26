@@ -19,6 +19,7 @@ import numpy as np
 from core.laya_client import LayaDecision, LayaTier1Client, not_awaited
 # The raw-corpus policy lives in one place and is consumed here rather than
 # re-derived: two definitions of "which sources are raw" would drift.
+from core.memory_index import SESSIONS_CHUNK_PREFIX
 from core.vector_index import is_excluded_source
 
 
@@ -85,6 +86,40 @@ def decisive_hit(best_score: float, floor: Optional[float], margin: Optional[flo
     if floor is None:
         return True
     return best_score >= floor + (DECISIVE_MARGIN if margin is None else margin)
+
+
+# Feeds whose chunks may inform a caller but never conclude for it.
+#
+# Measured 26.09.2026, the day the sessions feed was indexed: with 2620 chunks of
+# conversation in the corpus, a question about tomorrow's weather in Kyiv - one the
+# corpus cannot answer at all - came back DECISIVE at 0.5158 against a floor of
+# 0.3568, where without that feed the same question was refused at 0.4359.  Nothing
+# was retuned in between; the corpus changed.
+#
+# The reason is not a tuning failure, it is what a conversation is: it resembles any
+# question, because questions are most of what it consists of.  Whatever was discussed
+# once therefore looks like an answer to the same question asked again - the
+# self-reference the plan warned about.  Dropping reasoning and tool payloads at input
+# (`jev-collect --feed sessions`) took 74% of the history's text away and was still
+# not enough on its own, because the remaining 26% is the shape of the problem.
+#
+# So the sessions namespace keeps its material and loses its right to the decisive
+# label: it is served, ranked and assembled into the context exactly as before, and
+# the caller is told to judge for itself.  This is the plan's own option (а) - "вот что
+# обсуждалось, суди сам" - reached by measurement rather than by preference.
+NON_DECISIVE_PREFIXES: tuple[str, ...] = (SESSIONS_CHUNK_PREFIX,)
+
+
+def decisive_feed(chunk_id: str) -> bool:
+    """Whether a hit from this feed may be called decisive.
+
+    A chunk id that names no feed is not excluded: the rule is a statement about
+    conversations, and an unlabelled row is not one we know to be a conversation.
+    """
+    if not chunk_id:
+        return True
+    return not chunk_id.startswith(NON_DECISIVE_PREFIXES)
+
 FTS5_DB_PATH = os.getenv("JEV_FTS5_DB_PATH", str(PROJECT_ROOT / "storage" / "jev_fts5.db"))
 VECTOR_DB_PATH = os.getenv("JEV_VECTOR_DB_PATH", str(PROJECT_ROOT / "storage" / "jev_vectors.npz"))
 LIGHTRAG_API = os.getenv("JEV_LIGHTRAG_API", "http://localhost:8020")
@@ -317,6 +352,11 @@ class RoutingDecision:
     # so recording it is what makes the verdict auditable later: a threshold study can see
     # how far the hit stood out, instead of taking a label on faith.
     decisive_floor: Optional[float] = None
+    # The feed that stopped this hit from being called decisive, when the criterion
+    # was satisfied and the source may not conclude (`decisive_feed`).  Recorded so
+    # the journal says why the label is not decisive instead of leaving it to be
+    # inferred from a missing one.
+    decisive_blocked: Optional[str] = None
 
     @property
     def local_material_decisive(self) -> bool:
@@ -688,20 +728,28 @@ def _gate_selection(query: str, results: list[dict]) -> tuple[list[dict], list[d
     Sources are matched through `core.vector_index.is_excluded_source`, so the
     policy has exactly one definition (`JEV_VECTOR_EXCLUDE_SOURCES`).  A chunk
     indexed without a source is not the raw corpus.
+
+    Rows from a feed that may not conclude (a conversation - see
+    `NON_DECISIVE_PREFIXES`) are held back for the same reason as the raw corpus and
+    by the same mechanism: they are material worth carrying, and they are not a
+    verdict.  Without this, the wording of a past conversation took the decisive exit
+    on a question the corpus cannot answer at all.
     """
     survivors = [r for r in results if _is_fts_exact(query, r)]
+    informational = [r for r in survivors if not decisive_feed(str(r.get("chunk_id") or ""))]
+    survivors = [r for r in survivors if decisive_feed(str(r.get("chunk_id") or ""))]
     if not survivors or not FTS_GATE_REQUIRE_GOLDEN:
-        return survivors, []
+        return survivors, informational
     golden = [r for r in survivors if not is_excluded_source(str(r.get("source") or ""))]
     raw = [r for r in survivors if is_excluded_source(str(r.get("source") or ""))]
     if golden or not raw:
-        return golden, raw
+        return golden, raw + informational
     # Nothing but the raw corpus survived.  It keeps the exit only when its
     # best chunk is decisive - otherwise the held-back rows wait for the
     # vector tier, which searches the golden corpus.
     if _content_matches(query, raw[0]) >= FTS_GATE_RAW_EXIT_TERMS:
-        return raw, []
-    return [], raw
+        return raw, informational
+    return [], raw + informational
 
 
 def assemble_context(results: list[dict], budget: Optional[int] = None) -> tuple[str, dict]:
@@ -1219,6 +1267,12 @@ class JevRouter:
         if fts_exact:
             # Nothing in this answer needs the classifier, so nothing here waits
             # for it: the verdict rides along only if it already arrived.
+            #
+            # Only the decisive rows are served here.  The held-back rows (the OCR'd
+            # manual without vectors, and the feeds that may not conclude) are carried
+            # by the vector path below, which is where a request that did not find a
+            # verdict here ends up; on a decisive answer they would be extra material
+            # next to an answer already found.
             context, context_stats = assemble_context(fts_exact)
             return RoutingResult(
                 routing_decision=RoutingDecision(
@@ -1309,7 +1363,15 @@ class JevRouter:
         # The classifier no longer vetoes this exit.  Its strategy label comes
         # from the invented taxonomy, and a label that is wrong two times in
         # three must not be able to suppress a good vector hit.
-        if decisive_hit(best_score, decisive_floor):
+        decisive_blocked = None
+        if decisive_hit(best_score, decisive_floor) and vector_results:
+            top_chunk = str(vector_results[0].get("chunk_id") or "")
+            if not decisive_feed(top_chunk):
+                # There is material and it is close enough; it is not a verdict, because
+                # it comes from a conversation.  Measured: this is how a question about
+                # tomorrow's weather became decisive the day conversations were indexed.
+                decisive_blocked = top_chunk.split(":", 1)[0] + ":"
+        if decisive_hit(best_score, decisive_floor) and not decisive_blocked:
             # When the gate held raw rows back, they ride along after the
             # vector hits instead of being dropped: the manual is excluded
             # from the vector index on purpose, so dropping them here would
@@ -1328,6 +1390,7 @@ class JevRouter:
                     confidence_score=best_score,
                     tier1_exit=False,
                     decisive_floor=decisive_floor,
+                    decisive_blocked=decisive_blocked,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent="vector_search",
@@ -1437,6 +1500,7 @@ class JevRouter:
                     confidence_score=confidence,
                     tier1_exit=False,
                     decisive_floor=decisive_floor,
+                    decisive_blocked=decisive_blocked,
                 ),
                 extracted_metadata=ExtractedMetadata(
                     intent=intent,
@@ -1479,6 +1543,11 @@ class JevRouter:
             routing_decision=RoutingDecision(
                 strategy=Strategy.GRAPH_LIGHTRAG,
                 confidence_score=0.7,
+                # The local tiers were tried before this one and their numbers are what
+                # says why the graph was asked at all: a floor that was measured and a
+                # feed that withheld the verdict belong in the record of that request.
+                decisive_floor=decisive_floor,
+                decisive_blocked=decisive_blocked,
                 tier1_exit=False,
             ),
             extracted_metadata=ExtractedMetadata(

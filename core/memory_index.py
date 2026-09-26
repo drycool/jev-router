@@ -54,12 +54,17 @@ DEFAULT_PROJECTS_DIR = "/home/dry/LightRag/feeds/projects"
 # identities dilutes retrieval, because the two chunks compete and the winner is a
 # coin toss.
 DEFAULT_GITHUB_DIR = "/home/dry/LightRag/feeds/github"
+# And the agent's own history: what was decided in conversation, with the
+# deliberation left out at input (measured 26.09.2026: 12.6 M characters of
+# reasoning against 2.6 M of user and assistant text in the same database).
+DEFAULT_SESSIONS_DIR = "/home/dry/LightRag/feeds/sessions"
 ENTITY_TYPE = "memory"
 ENTITY_TYPE_CORPUS = ""
 MEMORY_CHUNK_PREFIX = "mem:"
 CORPUS_CHUNK_PREFIX = "gem:"
 PROJECT_CHUNK_PREFIX = "prj:"
 GITHUB_CHUNK_PREFIX = "gh:"
+SESSIONS_CHUNK_PREFIX = "ses:"
 # The server indexes LightRAG chunks at 2000 characters; staying under that keeps
 # one document from being penalised relative to another by the BM25 length norm.
 DEFAULT_MAX_CHARS = 1800
@@ -77,6 +82,8 @@ FEED_SPECS: tuple[tuple[str, str, str, str, str], ...] = (
      PROJECT_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
     ("github", "JEV_GITHUB_DIR", DEFAULT_GITHUB_DIR,
      GITHUB_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
+    ("sessions", "JEV_SESSIONS_DIR", DEFAULT_SESSIONS_DIR,
+     SESSIONS_CHUNK_PREFIX, ENTITY_TYPE_CORPUS),
 )
 
 

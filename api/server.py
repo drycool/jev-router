@@ -718,6 +718,10 @@ def _record_decision(
             # anything.  Without it the journal keeps the label and loses the measurement
             # behind it, and the next recalibration has to rebuild the corpus to know why.
             "decisive_floor": result.routing_decision.decisive_floor,
+            # Which feed stopped the label, when the criterion was satisfied and the
+            # source may not conclude.  The material is still in the context; only the
+            # verdict is withheld, and the journal says so instead of implying absence.
+            "decisive_blocked": result.routing_decision.decisive_blocked,
             "keywords": result.extracted_metadata.keywords,
             "entities": result.extracted_metadata.entities,
             "domain": result.extracted_metadata.domain,
@@ -917,6 +921,10 @@ async def query(req: QueryRequest):
             # to the corpus.  A consumer auditing a decisive label - or a refusal - needs
             # the number, not only the verdict.
             "decisive_floor": result.routing_decision.decisive_floor,
+            # Which feed stopped the label, when the criterion was satisfied and the
+            # source may not conclude.  The material is still in the context; only the
+            # verdict is withheld, and the journal says so instead of implying absence.
+            "decisive_blocked": result.routing_decision.decisive_blocked,
         },
         extracted_metadata={
             "intent": result.extracted_metadata.intent,
@@ -1113,6 +1121,10 @@ async def route_only(query: str = Query(..., min_length=1, max_length=16000)):
             # to the corpus.  A consumer auditing a decisive label - or a refusal - needs
             # the number, not only the verdict.
             "decisive_floor": result.routing_decision.decisive_floor,
+            # Which feed stopped the label, when the criterion was satisfied and the
+            # source may not conclude.  The material is still in the context; only the
+            # verdict is withheld, and the journal says so instead of implying absence.
+            "decisive_blocked": result.routing_decision.decisive_blocked,
         },
         "extracted_metadata": {
             "intent": result.extracted_metadata.intent,
