@@ -450,6 +450,15 @@ class QueryResponse(BaseModel):
     rag_configuration: dict
     target_agent: str
     context_preview: str = ""
+    # The assembled material, whole. `context_preview` is 500 characters, which is enough
+    # to see whether retrieval worked and useless for the thing a consumer actually asks
+    # for: "pick up what the project already knows about this". An agent that asks for
+    # context and receives a fragment concludes the gateway has nothing and answers from
+    # its own reasoning - measured on a real session, where a first message of "continue X,
+    # pick up the context from MEMORY" was answered by reasoning over the working tree
+    # while the material sat here. The assembly budget (JEV_MAX_CONTEXT_CHARS) still bounds
+    # this, and it is only ever returned because the caller asked for it.
+    context: str = ""
     # What retrieval actually handed the agent: chunks considered/used/dropped as
     # duplicates and the character budget in force. Provenance for the answer.
     context_stats: dict = Field(default_factory=dict)
@@ -905,6 +914,9 @@ async def query(req: QueryRequest):
         },
         target_agent=result.target_agent.value,
         context_preview=result.context[:500] if result.context else "",
+        # Same text, not truncated: the preview is for a human scanning a log, this is for
+        # the consumer that asked for the material.
+        context=result.context or "",
         context_stats=result.context_stats,
         agent_response=agent_response,
         elapsed_ms=round(elapsed, 2),

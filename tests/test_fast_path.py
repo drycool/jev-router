@@ -298,5 +298,41 @@ class FastPathMetricsTests(unittest.TestCase):
         self.assertIn("fast_path_exits_by_strategy", payload)
 
 
+class ConsumerShapeTests(unittest.TestCase):
+    """What a consumer actually receives, as opposed to what the router decided.
+
+    A consumer asked to "pick up the context" and handed a 500-character preview concludes
+    that the gateway has nothing and answers from its own reasoning. Measured: a dsh session
+    did exactly that, spending 3310 reasoning chunks and reading the memory files by hand
+    while the material sat in the router's answer.
+    """
+
+    def test_the_response_carries_the_material_whole_not_just_a_preview(self):
+        class Router:
+            async def route(self, _query):
+                return result_for(context="м" * 2281, sources=["/a.md"])
+
+        with patch.object(server, "router", Router()):
+            payload = TestClient(server.app).post(
+                "/query", json={"query": "q", "execute": False}
+            ).json()
+
+        self.assertEqual(len(payload["context"]), 2281)
+        self.assertEqual(len(payload["context_preview"]), 500)
+        self.assertEqual(payload["context_stats"]["sources"], ["/a.md"])
+
+    def test_the_material_is_the_same_text_the_model_would_have_been_given(self):
+        class Router:
+            async def route(self, _query):
+                return result_for(context="материал проекта")
+
+        with patch.object(server, "router", Router()):
+            client = TestClient(server.app)
+            without = client.post("/query", json={"query": "q", "execute": False}).json()
+            with_model = client.post("/query", json={"query": "q", "execute": True}).json()
+
+        self.assertIn(without["context"], with_model["agent_response"])
+
+
 if __name__ == "__main__":
     unittest.main()
