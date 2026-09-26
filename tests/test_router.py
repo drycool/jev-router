@@ -557,7 +557,13 @@ class RouterTests(unittest.TestCase):
                             router.laya = Laya()
                             router.get_embedding = embedding
                             router.tier2.search_vector = lambda *_, **__: [
-                                {"chunk_id": "vec:1", "content": "Neighbour",
+                                # The text shares content words with the query on purpose:
+                                # this test is about the *threshold* deciding the label, so
+                                # the lexical floor that also guards the decisive exit must
+                                # be satisfied - otherwise the assertion would be about the
+                                # floor and stop describing the threshold (see
+                                # `tests/test_decisive_feeds.py` for the floor itself).
+                                {"chunk_id": "vec:1", "content": "Neighbour: vector tier answer",
                                  "source": "/home/dry/memory/projects/x.md", "score": score,
                                  "entity_type": "memory", "search_type": "vector"},
                             ]

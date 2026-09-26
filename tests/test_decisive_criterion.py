@@ -22,6 +22,7 @@ What the tests below pin down:
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -35,9 +36,12 @@ import numpy as np  # noqa: E402
 from core.router import (  # noqa: E402
     DECISIVE_MARGIN,
     DECISIVE_MIN_CORPUS,
+    DECISIVE_MIN_SHARED_WORDS,
     SIMILARITY_THRESHOLD,
     Tier2Search,
     decisive_hit,
+    shared_words,
+    words,
 )
 from core.vector_index import save_index  # noqa: E402
 
@@ -234,3 +238,91 @@ class InstrumentVerdictTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControlSetTest(unittest.TestCase):
+    """The question set is used once, so a calibration needs a new one - and a new one
+    needs a home that no collector reads.  These tests pin both halves: the set is loaded
+    from a file, and a set that cannot answer anything is an error rather than a green
+    table of zeros.
+    """
+
+    def _instrument(self):
+        import importlib
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        import measure_decisive_criterion
+        return importlib.reload(measure_decisive_criterion)
+
+    def test_a_set_file_is_used_and_named(self):
+        instrument = self._instrument()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "set.json"
+            path.write_text(json.dumps({"positives": ["вопрос с ответом"],
+                                        "negatives": ["вопрос без ответа"]},
+                                       ensure_ascii=False), encoding="utf-8")
+            positives, negatives, label = instrument.load_control_set(path)
+        self.assertEqual(positives, ["вопрос с ответом"])
+        self.assertEqual(negatives, ["вопрос без ответа"])
+        self.assertEqual(label, str(path))
+
+    def test_without_a_file_the_built_in_spent_set_is_named_as_such(self):
+        instrument = self._instrument()
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "нет.json"
+            original = instrument.DEFAULT_CONTROL_SET
+            instrument.DEFAULT_CONTROL_SET = missing
+            try:
+                positives, negatives, label = instrument.load_control_set(None)
+            finally:
+                instrument.DEFAULT_CONTROL_SET = original
+        self.assertEqual(positives, instrument.POSITIVES)
+        self.assertIn("отработанный", label)
+
+    def test_an_explicit_path_that_does_not_exist_is_an_error(self):
+        instrument = self._instrument()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(SystemExit):
+                instrument.load_control_set(Path(directory) / "нет.json")
+
+    def test_a_half_written_set_is_refused_instead_of_measuring_nothing(self):
+        # "0 of 0 separated" is the one result that looks like success and means nothing.
+        instrument = self._instrument()
+        for payload in ({"positives": ["только позитив"]},
+                        {"negatives": ["только негатив"]},
+                        {"positives": [], "negatives": []}):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "set.json"
+                path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    instrument.load_control_set(path)
+
+
+class SharedWordsTest(unittest.TestCase):
+    """The lexical floor: a verdict with no shared content word is not a verdict."""
+
+    def test_stop_words_and_short_words_are_not_content(self):
+        self.assertEqual(words("чем кормить кота зимой"), {"кормить", "кота", "зимой"})
+        self.assertEqual(words("как и почему"), set())
+        self.assertEqual(words("Jev и порт"), {"порт"})       # three letters is not content
+        self.assertEqual(words("X728 и 12GB"), {"x728", "12gb"})
+
+    def test_no_shared_word_is_zero_and_one_shared_word_is_one(self):
+        self.assertEqual(shared_words("порог подобия", ["перечень цен на сервисы"]), 0)
+        self.assertEqual(shared_words("порог подобия", ["другой текст", "про порог в Jev"]), 1)
+
+    def test_a_question_of_stop_words_does_not_veto_itself(self):
+        # "почему это так" has no content to require; answering 0 would refuse every
+        # question phrased that way, which is not what the floor is for.
+        self.assertGreaterEqual(shared_words("почему это так", ["что угодно"]), 1)
+
+    def test_only_the_material_that_would_be_served_is_checked(self):
+        # The floor is about the text the caller receives, so a shared word deep in the
+        # ranking does not support a hit that is served at the top.
+        texts = ["текст без совпадений"] * 5 + ["порог подобия в Jev"]
+        self.assertEqual(shared_words("порог подобия в Jev", texts, limit=5), 0)
+        self.assertEqual(shared_words("порог подобия в Jev", texts, limit=6), 2)
+
+    def test_the_default_floor_is_the_calibrated_value(self):
+        # Tests do not load `.env`: a code default that disagrees with production is a
+        # configuration drift nobody sees until an agent trusts a wrong answer.
+        self.assertEqual(DECISIVE_MIN_SHARED_WORDS, 1)

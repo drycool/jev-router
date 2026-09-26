@@ -13,13 +13,13 @@ import os
 from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Any
+from typing import Any, Optional, Sequence
 
 import numpy as np
 from core.laya_client import LayaDecision, LayaTier1Client, not_awaited
 # The raw-corpus policy lives in one place and is consumed here rather than
 # re-derived: two definitions of "which sources are raw" would drift.
-from core.memory_index import SESSIONS_CHUNK_PREFIX
+from core.memory_index import CORPUS_CHUNK_PREFIX, SESSIONS_CHUNK_PREFIX
 from core.vector_index import is_excluded_source
 
 
@@ -88,6 +88,45 @@ def decisive_hit(best_score: float, floor: Optional[float], margin: Optional[flo
     return best_score >= floor + (DECISIVE_MARGIN if margin is None else margin)
 
 
+# Stop words are not content.  A question is "чем кормить кота зимой", not "чем" alone,
+# and a hit that shares only "как" with the question shares nothing.
+_STOP_WORDS = {
+    "что", "как", "чем", "для", "или", "это", "его", "она", "они", "при", "про",
+    "какой", "какая", "какие", "почему", "стоит", "подходит", "сегодня", "надо",
+    "наши", "наших", "было", "были", "того", "чтобы", "ли", "же", "он", "у",
+    "the", "and", "for", "with", "why", "does", "what",
+}
+
+
+def words(text: str) -> set[str]:
+    """Content words of a question or a chunk: four letters or more, minus stop words."""
+    import re
+    found = re.findall(r"[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}", text.lower())
+    return {word for word in found if word not in _STOP_WORDS}
+
+
+def shared_words(query: str, texts: Sequence[str], limit: int = 5) -> int:
+    """How many of the question's own content words appear in the material that is served.
+
+    Zero is the condition worth acting on.  Measured 26.09.2026 on a fresh control set: a
+    question about a music subscription was labelled *decisive* at 0.4713 against a floor
+    of 0.3473 - the margin rule was satisfied, and the chunk it pointed at shared not one
+    content word with the question.  All seven questions the corpus does answer shared at
+    least one.  A verdict with no lexical support at all is the vector tier deciding on
+    shape alone, which is the failure the whole criterion exists to prevent, so it is not
+    a verdict.
+    """
+    query_words = words(query)
+    if not query_words:
+        # A question of stop words only has no content to require.  Refusing it here would
+        # turn "почему это так" into a refusal of everything, which is not what was asked.
+        return 1
+    return max((len(query_words & words(text)) for text in texts[:limit]), default=0)
+
+
+DECISIVE_MIN_SHARED_WORDS = int(os.getenv("JEV_DECISIVE_MIN_SHARED_WORDS", "1"))
+
+
 # Feeds whose chunks may inform a caller but never conclude for it.
 #
 # Measured 26.09.2026, the day the sessions feed was indexed: with 2620 chunks of
@@ -107,7 +146,12 @@ def decisive_hit(best_score: float, floor: Optional[float], margin: Optional[flo
 # label: it is served, ranked and assembled into the context exactly as before, and
 # the caller is told to judge for itself.  This is the plan's own option (а) - "вот что
 # обсуждалось, суди сам" - reached by measurement rather than by preference.
-NON_DECISIVE_PREFIXES: tuple[str, ...] = (SESSIONS_CHUNK_PREFIX,)
+#
+# The chats namespace is the same class of document and is barred for the same reason: it
+# is a transcript of conversations, and what breaks the criterion is the *shape* of a
+# transcript, not which collector wrote it.  So the rule is about the kind of document,
+# not about a directory - a conversation may inform a caller but may not conclude for it.
+NON_DECISIVE_PREFIXES: tuple[str, ...] = (SESSIONS_CHUNK_PREFIX, CORPUS_CHUNK_PREFIX)
 
 
 def decisive_feed(chunk_id: str) -> bool:
@@ -1371,6 +1415,16 @@ class JevRouter:
                 # it comes from a conversation.  Measured: this is how a question about
                 # tomorrow's weather became decisive the day conversations were indexed.
                 decisive_blocked = top_chunk.split(":", 1)[0] + ":"
+            elif shared_words(query, [str(item.get("content") or "")
+                                      for item in vector_results]) < DECISIVE_MIN_SHARED_WORDS:
+                # Close enough, stands out from the floor, and shares not one content word
+                # with the question: the vector tier is answering on shape alone.  Measured
+                # on a fresh control set - one question out of six the corpus cannot answer
+                # was being called decisive at 0.4713 over a floor of 0.3473 with zero
+                # lexical support, while all seven answerable ones shared at least a word.
+                # The material is still served; only the verdict is withheld, and the
+                # journal says why instead of leaving it to be inferred.
+                decisive_blocked = "нет общих слов с вопросом"
         if decisive_hit(best_score, decisive_floor) and not decisive_blocked:
             # When the gate held raw rows back, they ride along after the
             # vector hits instead of being dropped: the manual is excluded

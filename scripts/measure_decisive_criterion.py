@@ -40,7 +40,15 @@ load_env()
 
 import numpy as np  # noqa: E402
 
-from core.router import EMBEDDING_API, EMBEDDING_MODEL, SIMILARITY_THRESHOLD, VECTOR_DB_PATH  # noqa: E402
+from core.router import (  # noqa: E402
+    DECISIVE_MIN_SHARED_WORDS,
+    EMBEDDING_API,
+    EMBEDDING_MODEL,
+    SIMILARITY_THRESHOLD,
+    VECTOR_DB_PATH,
+    shared_words,
+    words,
+)
 from core.vector_index import load_index  # noqa: E402
 
 # The sample the floor is measured on.  Fixed seed and size, so two runs of this script
@@ -52,6 +60,12 @@ NULL_SAMPLE_SIZE = 512
 # top hit better than the best of 512 random chunks", a lower one asks "is it better than
 # the bulk of them".  Which question separates the two sets is a measurement, not a taste.
 FLOOR_QUANTILES = (0.90, 0.95, 0.99)
+
+# Where the live question set lives.  Inside the repository but outside every feed and
+# outside git, so that writing the questions down cannot be the contamination they are
+# meant to detect (a `.md` file under any collected directory would be indexed, and a
+# commit message quoting them would be indexed too).
+DEFAULT_CONTROL_SET = Path(__file__).resolve().parent.parent / "storage" / "control_set.json"
 
 # Questions the corpus answers.  Each one names a piece of material that is really in the
 # base, so a refusal here is a false negative and a failure of the criterion.
@@ -100,25 +114,20 @@ def document_of(chunk_id: str) -> str:
     return chunk_id.split("#", 1)[0]
 
 
-def words(text: str) -> set[str]:
-    """Content words, crudely: enough to ask "does the chunk mention the question"."""
-    import re
-    stop = {"что", "как", "чем", "для", "или", "это", "его", "она", "они", "при", "про",
-            "какой", "какая", "какие", "почему", "стоит", "подходит", "сегодня", "надо",
-            "наши", "наших", "было", "были", "того", "чтобы", "ли", "же", "он", "у",
-            "почему", "the", "and", "for", "with", "why", "does", "what"}
-    return {w for w in re.findall(r"[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}", text.lower())
-            if w not in stop}
+# The instrument and the router must agree on what a content word is, so there is one
+# definition and the router holds it.  Two spellings of "lexical support" would drift, and
+# the drift would show up as an instrument that reports a rule the router does not apply.
 
 
 class Verdict(NamedTuple):
-    """What the table says, split by what the failure actually is.
+    """What the table means, as opposed to what it says.
 
-    Two different things look the same in a raw count and call for different actions: a
-    negative that clears the bar through the literal tier means the corpus *contains* the
-    question's words (a quotation in a note or a commit message - the corpus cannot be
-    fixed, only the question set can), while one that clears it through the vector tier
-    means the criterion let noise through, which is the criterion's own failure.
+    A raw count of "negatives that stayed non-decisive" made two different failures look
+    like one.  A negative answered by the *literal* tier means the corpus physically
+    contains the question's own words - commit messages and notes quote what was measured
+    - and the only fix is a new question set.  A negative answered by the *vector* tier is
+    the criterion's own defect, and it is fixed by changing the criterion.  The first is
+    acknowledged; the second fails.
     """
 
     ok: bool
@@ -239,10 +248,43 @@ def via_api(queries: list[str], base: str) -> list[dict]:
     return rows
 
 
+def load_control_set(path: str | Path | None = None) -> tuple[list[str], list[str], str]:
+    """The live question set, from a file that is deliberately outside the corpus.
+
+    The built-in lists below are the *spent* set: an `exact_fts` verdict means the corpus
+    contains the question's own words, and commit messages and notes quote what was
+    measured, so a set is used once.  A calibration therefore needs a new set, and a new
+    set needs a home that no collector reads - otherwise writing it down would itself be
+    the contamination it is meant to detect.  `storage/control_set.json` is inside the
+    repository but outside every feed: the projects collector takes `.md` files, the
+    memory feed takes the note directory, and this file is neither (it is also not in
+    git, so no commit message can quote it).
+
+    Returns ``(positives, negatives, label)``.  An unreadable or empty set is an error
+    rather than an empty measurement: a table of "0 of 0 separated" is the one result
+    that looks like success and means nothing.
+    """
+    if path is None:
+        path = DEFAULT_CONTROL_SET
+    source = Path(path)
+    if not source.exists():
+        if path != DEFAULT_CONTROL_SET:
+            raise SystemExit(f"нет набора вопросов {source}")
+        return list(POSITIVES), list(NEGATIVES), "встроенный (отработанный)"
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    positives = [str(item) for item in payload.get("positives") or []]
+    negatives = [str(item) for item in payload.get("negatives") or []]
+    if not positives or not negatives:
+        raise SystemExit(f"набор {source} пуст: нужны и позитивы, и негативы")
+    return positives, negatives, str(source)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument("--sample", type=int, default=NULL_SAMPLE_SIZE)
+    parser.add_argument("--set", dest="control_set", default=None,
+                        help=f"набор вопросов в JSON (по умолчанию {DEFAULT_CONTROL_SET})")
     parser.add_argument("--via-api", action="store_true",
                         help="ask the live router instead of measuring the archive")
     parser.add_argument("--base", default="http://127.0.0.1:8030")
@@ -250,15 +292,18 @@ def main() -> int:
 
     quantiles = FLOOR_QUANTILES
     index = load_index(VECTOR_DB_PATH)
+    positives_set, negatives_set, label = load_control_set(args.control_set)
 
     if args.via_api:
-        positives = via_api(POSITIVES, args.base)
-        negatives = via_api(NEGATIVES, args.base)
+        positives = via_api(positives_set, args.base)
+        negatives = via_api(negatives_set, args.base)
         if args.json:
-            print(json.dumps({"positives": positives, "negatives": negatives},
-                             ensure_ascii=False, indent=2))
+            print(json.dumps({"control_set": label, "positives": positives,
+                              "negatives": negatives}, ensure_ascii=False, indent=2))
             return 0
         print(f"через живой роутер {args.base} (execute=false):\n")
+        print(f"набор вопросов: {label}")
+        print(f"  позитивов {len(positives_set)}, негативов {len(negatives_set)}\n")
         for label, rows in (("ПОЗИТИВЫ (должны быть решающими)", positives),
                             ("НЕГАТИВЫ (должны быть не решающими)", negatives)):
             print(label)
@@ -288,21 +333,23 @@ def main() -> int:
               "отвечает на них сам. Для повторной калибровки нужен новый набор вопросов.")
         return 0 if expected else 1
 
-    positives = measure(POSITIVES, quantiles, args.sample)
-    negatives = measure(NEGATIVES, quantiles, args.sample)
+    positives = measure(positives_set, quantiles, args.sample)
+    negatives = measure(negatives_set, quantiles, args.sample)
 
     if args.json:
-        print(json.dumps({"positives": positives, "negatives": negatives,
+        print(json.dumps({"control_set": label, "positives": positives,
+                          "negatives": negatives,
                           "threshold": SIMILARITY_THRESHOLD, "sample": args.sample},
                          ensure_ascii=False, indent=2))
         return 0
 
     print(f"корпус: {len(index['embeddings'])} векторов, модель {index['model']}, "
           f"выборка пола: {args.sample} векторов с фиксированным зерном")
-    print(f"абсолютный порог сейчас: {SIMILARITY_THRESHOLD}\n")
-    for label, rows in (("ПОЗИТИВЫ (материал в базе есть)", positives),
+    print(f"абсолютный порог сейчас: {SIMILARITY_THRESHOLD}")
+    print(f"набор вопросов: {label}\n")
+    for title, rows in (("ПОЗИТИВЫ (материал в базе есть)", positives),
                         ("НЕГАТИВЫ (материала нет)", negatives)):
-        print(f"{label}")
+        print(f"{title}")
         heads = "".join(f"{'пол' + str(q):>9}" for q in quantiles)
         print(f"{'топ-1':>7}{heads}{'запас99':>9}{'согл':>6}{'лекс':>7}{'сейчас':>11}   запрос")
         for row in rows:
