@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import NamedTuple
 import json
 import sys
 import urllib.request
@@ -108,6 +109,45 @@ def words(text: str) -> set[str]:
             "почему", "the", "and", "for", "with", "why", "does", "what"}
     return {w for w in re.findall(r"[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}", text.lower())
             if w not in stop}
+
+
+class Verdict(NamedTuple):
+    """What the table says, split by what the failure actually is.
+
+    Two different things look the same in a raw count and call for different actions: a
+    negative that clears the bar through the literal tier means the corpus *contains* the
+    question's words (a quotation in a note or a commit message - the corpus cannot be
+    fixed, only the question set can), while one that clears it through the vector tier
+    means the criterion let noise through, which is the criterion's own failure.
+    """
+
+    ok: bool
+    reason: str
+    contaminated: tuple[str, ...]
+    false_positives: tuple[str, ...]
+
+
+def classify(positives: list[dict], negatives: list[dict]) -> Verdict:
+    kept = [r for r in positives if r["decisive"]]
+    missed = [r["query"] for r in positives if not r["decisive"]]
+    contaminated = tuple(r["query"] for r in negatives
+                         if r["decisive"] and r["strategy"] == "exact_fts")
+    false_positives = tuple(r["query"] for r in negatives
+                            if r["decisive"] and r["strategy"] != "exact_fts")
+    if missed:
+        return Verdict(False, f"критерий теряет настоящие ответы: {missed}",
+                       contaminated, false_positives)
+    if false_positives:
+        return Verdict(False, "критерий пропускает шум векторным тиром: "
+                              f"{list(false_positives)} - смотреть таблицу",
+                       contaminated, false_positives)
+    if contaminated:
+        return Verdict(True, "критерий разделяет по векторному тиру; "
+                             f"{len(contaminated)} негатив(ов) отвечает буквальный тир - "
+                             "это цитата в корпусе, а не критерий; набор вопросов нужен новый",
+                       contaminated, false_positives)
+    return Verdict(True, f"критерий разделяет: {len(kept)}/{len(positives)} позитивов, "
+                         f"0/{len(negatives)} негативов", contaminated, false_positives)
 
 
 def measure(queries: list[str], floor_quantiles: tuple[float, ...], sample_size: int) -> list[dict]:
@@ -240,9 +280,9 @@ def main() -> int:
                     tiers[row["strategy"]] = tiers.get(row["strategy"], 0) + 1
             print(f"  решающих: {verdict} из {len(rows)}"
                   + (f"  (по тирам: {tiers})" if tiers else "") + "\n")
-        expected = (sum(1 for r in positives if r["decisive"]) == len(positives)
-                    and not any(r["decisive"] for r in negatives))
-        print("итог:", "критерий разделяет" if expected else "КРИТЕРИЙ НЕ РАЗДЕЛЯЕТ - смотреть таблицу")
+        verdict = classify(positives, negatives)
+        print("итог:", verdict.reason)
+        expected = verdict.ok
         print("напоминание: контрольные запросы нельзя цитировать в индексируемом тексте - "
               "заметки и сообщения коммитов попадают в корпус, и тогда буквальный тир "
               "отвечает на них сам. Для повторной калибровки нужен новый набор вопросов.")

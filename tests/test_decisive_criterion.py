@@ -174,5 +174,63 @@ class CorpusFloorTests(unittest.TestCase):
         self.assertTrue(decisive_hit(neighbours[0]["score"], floor))
 
 
+class InstrumentVerdictTests(unittest.TestCase):
+    """The instrument's own summary line, which used to cry failure for the wrong reason.
+
+    A raw count called both failures the same thing.  A negative answered by the literal
+    tier means the corpus *contains* the question's words - a quotation in a note or a
+    commit message, which no amount of calibration can fix and only a new question set
+    can work around - while one answered by the vector tier means the criterion let noise
+    through, which is the criterion's own defect.  Reporting the first as "the criterion
+    does not separate" sends the next reader to retune a rule that is working.
+    """
+
+    def _row(self, query, decisive, strategy):
+        return {"query": query, "decisive": decisive, "strategy": strategy}
+
+    def _instrument(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        import measure_decisive_criterion
+        return measure_decisive_criterion
+
+    def test_a_quotation_in_the_corpus_is_not_the_criterion_failing(self):
+        instrument = self._instrument()
+        verdict = instrument.classify(
+            positives=[self._row("настоящий вопрос", True, "exact_fts")],
+            negatives=[self._row("вопрос, ответа на который нет", True, "exact_fts")],
+        )
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertEqual(len(verdict.contaminated), 1)
+        self.assertIn("буквальный", verdict.reason)
+
+    def test_noise_through_the_vector_tier_is_the_criterion_failing(self):
+        instrument = self._instrument()
+        verdict = instrument.classify(
+            positives=[self._row("настоящий вопрос", True, "vector_fast")],
+            negatives=[self._row("шум", True, "vector_fast")],
+        )
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.false_positives, ("шум",))
+        self.assertEqual(verdict.contaminated, ())
+
+    def test_a_lost_answer_names_the_question(self):
+        instrument = self._instrument()
+        verdict = instrument.classify(
+            positives=[self._row("потерянный ответ", False, "vector_low_confidence")],
+            negatives=[],
+        )
+        self.assertFalse(verdict.ok)
+        self.assertIn("потерянный ответ", verdict.reason)
+
+    def test_a_clean_table_says_so(self):
+        instrument = self._instrument()
+        verdict = instrument.classify(
+            positives=[self._row("а", True, "exact_fts")],
+            negatives=[self._row("б", False, "vector_low_confidence")],
+        )
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertIn("разделяет", verdict.reason)
+
+
 if __name__ == "__main__":
     unittest.main()
