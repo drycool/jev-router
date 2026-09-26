@@ -323,3 +323,43 @@ async def embed_texts(client, api: str, model: str, texts: Sequence[str],
     if not vectors:
         return np.zeros((0, 0), dtype=np.float32)
     return np.asarray(vectors, dtype=np.float32)
+
+def reusable_embeddings(index: dict, chunks: Sequence[tuple[str, str, str]],
+                        prefix: str) -> tuple[np.ndarray, np.ndarray]:
+    """Stored vectors for the chunks whose text has not changed, in the caller's order.
+
+    Returns ``(embeddings, needs_embedding)``: a matrix shaped and ordered like
+    ``chunks``, holding the archive's vector for every chunk whose text is already
+    there and zeros elsewhere, plus the boolean mask of the rows a caller must embed.
+
+    The daily refresh needs this.  A feed of 2620 chunks with 15 changed ones costs the
+    embedder's whole pass if everything is re-embedded, and on this host the embedder is
+    a model on another machine that sleeps by default: paying two minutes of GPU wake-up
+    to recompute 3605 identical vectors is the difference between a schedule that can run
+    unattended and one that cannot.
+    """
+    dimension = int(index.get("dimension") or 0)
+    if not dimension:
+        # An archive without a dimension cannot be indexed against: nothing is reusable
+        # and the caller has to build one from scratch (build_vector_index.py).
+        return np.zeros((len(chunks), 0), dtype=np.float32), np.ones(len(chunks), dtype=bool)
+    embeddings = np.zeros((len(chunks), dimension), dtype=np.float32)
+    needs = np.ones(len(chunks), dtype=bool)
+
+    stored: dict[str, tuple[str, np.ndarray]] = {}
+    for chunk_id, content, embedding in zip(index["chunk_ids"], index["contents"],
+                                            index["embeddings"]):
+        if str(chunk_id).startswith(prefix):
+            stored[str(chunk_id)] = (str(content), np.asarray(embedding, dtype=np.float32))
+
+    for row, (chunk_id, content, _source) in enumerate(chunks):
+        entry = stored.get(str(chunk_id))
+        if entry is None or entry[0] != str(content):
+            continue
+        if entry[1].shape != (dimension,):
+            # A stored vector of the wrong width is not reusable and must not be
+            # pasted into the matrix: the merge checks the matrix, not each row.
+            continue
+        embeddings[row] = entry[1]
+        needs[row] = False
+    return embeddings, needs
