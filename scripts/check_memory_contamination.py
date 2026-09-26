@@ -38,8 +38,10 @@ from core.vector_index import is_excluded_source  # noqa: E402
 DEFAULT_DB = PROJECT_ROOT / "storage" / "jev_fts5.db"
 
 # (query, the file that must answer it).  An empty expectation means "no document
-# should answer this at all".
-CONTROL_QUERIES: list[tuple[str, str]] = [
+# should answer this at all".  An expectation may name several sources: a question
+# can be answerable from the owner's own note *and* from the conversation that note
+# summarises, and neither of them is a finding describing the query.
+CONTROL_QUERIES: list[tuple[str, str | tuple[str, ...]]] = [
     ("включать демоны пользователя автоматически при загрузке", "linux_systemd.md"),
     ("проверка типов на асинхронных маршрутах", "fastapi_pydantic.md"),
     ("Как устроена двухслойная конфигурация garageOS и чёрный ящик инцидентов", "garageos.md"),
@@ -50,16 +52,26 @@ CONTROL_QUERIES: list[tuple[str, str]] = [
     # question's own words into the corpus would make the note answer the question
     # it says is unanswerable.  Empty expectation = nobody may take the gate.
     ("как идут запросы и есть ли промежуточные сервисы", ""),
-    # This one *is* answerable - the board material is the right source - so the
-    # expectation names it and the guard only fires on a third document trying to
-    # take the gate away from it.
-    ("UPS HAT и Orange PI4 Pro возможно взаимодействие?", "carpc"),
+    # This one *is* answerable, and from two places since the chat import: the
+    # board material is the summary, and the conversation it summarises is the
+    # original.  Measured after the import: the conversation takes the gate at
+    # 0.95 / 53 ms, which is the right material and not a leak - the guard fires
+    # only on a *third* document trying to take it away from both.
+    ("UPS HAT и Orange PI4 Pro возможно взаимодействие?", ("carpc", "Gemini")),
     ("Какая погода в Киеве завтра", ""),
     ("Купить билеты на поезд Киев Львов", ""),
 ]
 
 
-def competitors(rows, query: str, expected: str) -> list[tuple[str, list[str]]]:
+def is_expected(chunk_id: str, expected: str | tuple[str, ...]) -> bool:
+    """Whether this chunk is one of the sources allowed to answer the query."""
+    if not expected:
+        return False
+    sources = (expected,) if isinstance(expected, str) else expected
+    return any(source in chunk_id for source in sources)
+
+
+def competitors(rows, query: str, expected: str | tuple[str, ...]) -> list[tuple[str, list[str]]]:
     """Indexed, non-raw chunks that would pass the gate for this query.
 
     `rows` is an iterable of (chunk_id, content, source).  Pure, so the rule is
@@ -74,8 +86,8 @@ def competitors(rows, query: str, expected: str) -> list[tuple[str, list[str]]]:
     for chunk_id, content, source in rows:
         if is_excluded_source(str(source)):
             continue  # the raw corpus is expected to match ordinary words
-        if expected and expected in str(chunk_id):
-            continue  # the file that should answer is not a competitor
+        if is_expected(str(chunk_id), expected):
+            continue  # the source that should answer is not a competitor
         terms = set(re.findall(r"\b[\wа-яА-ЯёЁ]+\b", str(content).lower()))
         inside = [k for k in content_keywords if k.lower() in terms]
         if len(inside) >= threshold:

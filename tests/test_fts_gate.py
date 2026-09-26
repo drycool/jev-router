@@ -187,6 +187,30 @@ class MemoryContaminationTests(unittest.TestCase):
                  "/home/dry/memory/projects/x.md")]
         self.assertEqual(competitors(rows, "Кабели для Raspberry Pi 5", "Gemini"), [])
 
+    def test_a_question_may_have_more_than_one_legitimate_source(self):
+        """The summary and the conversation it summarises are both answers.
+
+        The chat import made this real: the board question is answered by the
+        memory note and by the conversation the note was written from, and the
+        guard must still catch a *third* document that echoes the query.
+        """
+        rows = [
+            ("gem:Gemini-Ups hat-20260913.md#0",
+             "Ups hat на orange pi4 pro для бортового компа",
+             "/home/dry/LightRag/gemini_chats/Gemini-Ups hat-20260913.md"),
+            ("mem:projects/carpc_orange_pi.md#3",
+             "UPS HAT и Orange PI4 Pro совместимость",
+             "/home/dry/memory/projects/carpc_orange_pi.md"),
+            ("mem:projects/jev_ops_defects.md#9",
+             "UPS HAT Orange PI4 Pro разбор дефекта",
+             "/home/dry/memory/projects/jev_ops_defects.md"),
+        ]
+        found = competitors(rows, "UPS HAT и Orange PI4 Pro возможно взаимодействие?",
+                            ("carpc", "Gemini"))
+        self.assertEqual([chunk_id for chunk_id, _ in found],
+                         ["mem:projects/jev_ops_defects.md#9"],
+                         "a document that only echoes the query is still a competitor")
+
 
 if __name__ == "__main__":
     unittest.main()
