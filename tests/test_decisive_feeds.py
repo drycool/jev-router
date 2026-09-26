@@ -102,7 +102,8 @@ class SessionHitEndToEnd(unittest.TestCase):
     """Through the router, with a synthetic index and no network."""
 
     def _router(self, top_chunk_id: str,
-                top_text: str = "чанк про порог подобия в Jev"):
+                top_text: str = "чанк про порог подобия в Jev",
+                second: tuple[str, str, float] | None = None):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         index_path = Path(directory.name) / "vectors.npz"
@@ -122,6 +123,13 @@ class SessionHitEndToEnd(unittest.TestCase):
         # and the namespace must be the only thing that differs.  A hit with no shared word
         # is a separate test below.
         contents = [top_text] + [f"чанк {i}" for i in range(1, rows)]
+        if second is not None:
+            # A second planted hit, just below the first: the case where a conversation
+            # ranks above a document and used to veto it.
+            second_id, second_text, factor = second
+            chunk_ids[1] = second_id
+            contents[1] = second_text
+            embeddings[1] = query_direction * factor
         save_index(index_path, {
             "embeddings": embeddings.astype(np.float32),
             "chunk_ids": np.array(chunk_ids),
@@ -168,6 +176,28 @@ class SessionHitEndToEnd(unittest.TestCase):
         self.assertFalse(decision.local_material_decisive)
         self.assertEqual(decision.decisive_blocked, "ses:")
         # Материал не потерян: понижение — смена ярлыка, не удаление.
+        self.assertIn("чанк про порог подобия", result.context or "")
+
+    def test_a_conversation_above_a_document_does_not_veto_it(self):
+        """Measured 26.09.2026, after the chats feed reached 7090 chunks.
+
+        The criterion was evaluated at the top of the ranking, so a conversation 0.03
+        closer than the note that answers the question suppressed the verdict - three of
+        seven answerable questions lost it that way.  The verdict now comes from the best
+        hit that is allowed to give one; ranking is untouched.
+        """
+        router = self._router("ses:cli__20260926.md#3",
+                              second=("prj:Jev__commits.md#5", "чанк про порог подобия в Jev",
+                                      0.97))
+        result = asyncio.run(router.route("порог подобия в Jev"))
+        decision = result.routing_decision
+        self.assertEqual(decision.strategy, Strategy.VECTOR_FAST)
+        self.assertTrue(decision.local_material_decisive)
+        self.assertIsNone(decision.decisive_blocked)
+        # Confidence still describes the best material, not the one that decided.
+        self.assertGreater(decision.confidence_score, 0.97)
+        # And the conversation keeps its place in the material: only the right to
+        # conclude moved.
         self.assertIn("чанк про порог подобия", result.context or "")
 
     def test_a_chat_transcript_cannot_conclude_either(self):

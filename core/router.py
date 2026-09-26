@@ -1407,16 +1407,23 @@ class JevRouter:
         # The classifier no longer vetoes this exit.  Its strategy label comes
         # from the invented taxonomy, and a label that is wrong two times in
         # three must not be able to suppress a good vector hit.
+        #
+        # The verdict is taken from the best hit that is *allowed* to give one, not from
+        # the best hit overall.  Measured 26.09.2026, once the chats feed held 7090 chunks:
+        # evaluating the criterion at the top of the ranking let a conversation's score
+        # veto a document that would have cleared it - a transcript that is 0.03 closer
+        # could suppress the only citable answer in the base, and three of seven questions
+        # the corpus answers lost their verdict that way.  The same measurement on two
+        # control sets says the documents that decide this way never let an unanswerable
+        # question through: 0 of 6, both times.  Ranking is untouched - the conversation
+        # stays where relevance puts it; only the right to conclude moves.
         decisive_blocked = None
-        if decisive_hit(best_score, decisive_floor) and vector_results:
-            top_chunk = str(vector_results[0].get("chunk_id") or "")
-            if not decisive_feed(top_chunk):
-                # There is material and it is close enough; it is not a verdict, because
-                # it comes from a conversation.  Measured: this is how a question about
-                # tomorrow's weather became decisive the day conversations were indexed.
-                decisive_blocked = top_chunk.split(":", 1)[0] + ":"
-            elif shared_words(query, [str(item.get("content") or "")
-                                      for item in vector_results]) < DECISIVE_MIN_SHARED_WORDS:
+        candidate = next((item for item in vector_results
+                          if decisive_feed(str(item.get("chunk_id") or ""))), None)
+        candidate_score = float(candidate["score"]) if candidate else 0.0
+        if decisive_hit(candidate_score, decisive_floor) and candidate is not None:
+            if shared_words(query, [str(item.get("content") or "")
+                                    for item in vector_results]) < DECISIVE_MIN_SHARED_WORDS:
                 # Close enough, stands out from the floor, and shares not one content word
                 # with the question: the vector tier is answering on shape alone.  Measured
                 # on a fresh control set - one question out of six the corpus cannot answer
@@ -1425,7 +1432,15 @@ class JevRouter:
                 # The material is still served; only the verdict is withheld, and the
                 # journal says why instead of leaving it to be inferred.
                 decisive_blocked = "нет общих слов с вопросом"
-        if decisive_hit(best_score, decisive_floor) and not decisive_blocked:
+        elif decisive_hit(best_score, decisive_floor) and vector_results:
+            # Something in the base clears the criterion and still may not conclude: it is
+            # a conversation.  Measured: this is how a question about tomorrow's weather
+            # became decisive the day conversations were indexed.
+            top_chunk = str(vector_results[0].get("chunk_id") or "")
+            decisive_blocked = top_chunk.split(":", 1)[0] + ":" if ":" in top_chunk[:12] \
+                else "беседа"
+        if decisive_hit(candidate_score, decisive_floor) and not decisive_blocked \
+                and candidate is not None:
             # When the gate held raw rows back, they ride along after the
             # vector hits instead of being dropped: the manual is excluded
             # from the vector index on purpose, so dropping them here would
