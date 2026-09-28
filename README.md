@@ -81,6 +81,36 @@ curl -X POST http://127.0.0.1:8030/decision-test \
 
 This endpoint is intentionally diagnostic: it records metrics and fallback behavior, but it does not alter `/query` routing.
 
+## Warming the prefix head before a long session
+
+The provider's cache is a byte-exact prefix cache, so the **first request of a session** is
+the only one that pays full price for the head of the context - system prompt, tool list,
+skill index.  Measured on the live loop: 6% cache hits and $0.0031 for the first request
+against 99% and $0.000087 for the same context a minute later, 35 times cheaper.
+
+```bash
+hermes-warm --check                                  # what state is the head in right now
+hermes-warm -m deepseek-v4-flash -p deepseek         # warm it with the same model
+hermes-warm -t terminal --in ~/Jev                   # mirror the toolset and cwd too
+```
+
+**What it honestly buys.**  A warm-up moves the miss onto a cheap service request; it does
+not remove it.  A single long session gains nothing from it, because it would have paid that
+one miss anyway.  It pays off when one head is used by several runs (cron, subagents, a
+batch of probes): one miss then replaces N.  The multi-megabyte cold starts - a session's
+history being re-uploaded after a resume or a compaction - are not addressable this way at
+all: there the head hits and the history does not.  That is why the script always prints what
+the warm-up itself cost and how many hits the head got, and why the dashboard shows the two
+causes separately.
+
+`--check` reads the last session in the log instead of calling anything, and `--json` gives
+the same numbers machine-readable.  The warm-up is an ordinary Hermes session and stays in
+the database as one.
+
+The money side of this lives in the dashboard (`python3 viz/server.py`, port 8035), section
+«Холодный старт»; see `viz/README.md` for how those numbers are computed and where they stop
+being facts.
+
 ## Shadow Mode
 
 A candidate engine can be probed on live traffic without being allowed to steer anything:
