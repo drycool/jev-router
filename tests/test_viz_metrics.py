@@ -19,9 +19,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from viz.metrics import (dashboard, hermes_summary, jev_summary, percent, percentile,  # noqa: E402
-                         sqz_plugin_summary, sqz_summary)
-from viz.server import bar, render_page, rows  # noqa: E402
+from viz.metrics import (dashboard, estimate_cost, estimate_cost_off_peak,  # noqa: E402
+                         hermes_summary, jev_summary, load_prices, percent, percentile,
+                         price_for, sqz_plugin_summary, sqz_summary)
+from viz.server import bar, cost_block, render_page, rows  # noqa: E402
 
 
 def make_hermes(path: Path) -> Path:
@@ -353,3 +354,72 @@ class TableRenderingTest(unittest.TestCase):
     def test_header_row_is_a_real_thead(self):
         page = rows([["a", "b"], ["1", "2"]])
         self.assertIn("<thead><tr><th>a</th><th>b</th></tr></thead>", page)
+
+
+class CostTest(unittest.TestCase):
+    """Деньги считаются по тарифу владельца, а не по догадке.
+
+    Цену DeepSeek я снял с живой страницы вендора: там пик 01:00-04:00 и 06:00-10:00 UTC
+    по будням, всё остальное вне пика и ВДВОЕ дешевле. Одно число тут было бы
+    выдумкой, поэтому считается вилка, и обе границы обязаны быть согласованы.
+    """
+
+    PEAK = {"input": 0.3, "cache_read": 0.006, "output": 1.2,
+            "off_peak": {"input": 0.15, "cache_read": 0.003, "output": 0.6}}
+    TOKENS = {"input_tokens": 1_000_000, "output_tokens": 1_000_000, "cache_read_tokens": 1_000_000}
+
+    def test_off_peak_is_exactly_half(self):
+        self.assertEqual(estimate_cost(self.TOKENS, self.PEAK), 1.506)
+        self.assertEqual(estimate_cost_off_peak(self.TOKENS, self.PEAK), 0.753)
+
+    def test_rate_set_without_off_peak_gives_none_not_a_guess(self):
+        price = {"input": 0.5, "cache_read": 0.05, "output": 3.0}
+        self.assertIsNone(estimate_cost_off_peak(self.TOKENS, price))
+
+    def test_missing_rate_means_unpriced_not_free(self):
+        """Ноль и «нет данных» - разные вещи: без ставки стоимость не показывается."""
+        self.assertIsNone(estimate_cost(self.TOKENS, {"input": 1.0, "output": 1.0}))
+        self.assertIsNone(estimate_cost(self.TOKENS, {}))
+
+    def test_price_lookup_by_long_file_name(self):
+        prices = {"qwen2.5-3b-instruct-q5_k_m.gguf": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}
+        found = price_for(prices, "telegram//home/dry/llama.cpp/models/qwen2.5-3b-instruct-q5_k_m.gguf")
+        self.assertIsNotNone(found)
+
+    def test_longest_match_wins(self):
+        prices = {"ornith-1.5:9b": {"input": 9.0},
+                  "ornith-1.5-9b-256k:latest": {"input": 1.0}}
+        self.assertEqual(price_for(prices, "telegram/ornith-1.5-9b-256k:latest"), {"input": 1.0})
+
+    def test_unknown_model_has_no_price(self):
+        self.assertIsNone(price_for({"a": {}}, "cli/неизвестная-модель"))
+
+    def test_owner_price_file_is_complete_and_halves_agree(self):
+        """Файл владельца: у каждой модели все три ставки, вне пика ровно вдвое ниже."""
+        prices = load_prices()
+        self.assertTrue(prices, "viz/prices.json не читается")
+        for name, price in prices.items():
+            for key in ("input", "cache_read", "output"):
+                self.assertIn(key, price, f"{name}: нет ставки {key}")
+            if "off_peak" in price:
+                for key in ("input", "cache_read", "output"):
+                    self.assertAlmostEqual(price["off_peak"][key], price[key] / 2, places=9,
+                                           msg=f"{name}: внепиковая ставка {key} не вдвое ниже")
+        for name in ("deepseek-v4-flash", "deepseek-v4-pro", "ornith-1.5-9b-256k"):
+            self.assertIn(name, prices)
+
+    def test_page_shows_both_bounds_and_names_unpriced(self):
+        combined = {"cost": [{"model": "cli/deepseek-v4-flash", "cost": 11.52, "cost_off_peak": 5.76,
+                              "input_tokens": 9_000_000, "cache_read_tokens": 1_100_000_000,
+                              "output_tokens": 2_000_000}],
+                    "cost_total": 11.52, "cost_total_off_peak": 5.76,
+                    "cost_per_session": 0.0768, "cost_per_session_off_peak": 0.0384,
+                    "cost_unpriced_models": ["cli/minimax-m3"]}
+        page = cost_block(combined, {})
+        self.assertIn("5.76", page)
+        self.assertIn("0.0768", page)
+        self.assertIn("minimax-m3", page)
+        self.assertIn("deepseek-v4-flash", page)
+
+    def test_cost_block_is_empty_without_prices(self):
+        self.assertEqual(cost_block({"cost": []}, {}), "")

@@ -113,6 +113,47 @@ def plugin_block(plugin: dict) -> str:
            if tool_rows else ""}"""
 
 
+def cost_block(combined: dict, hermes: dict) -> str:
+    """Что стоило окно: вилка «пик … вне пика» и цена на задачу.
+
+    Одно число здесь было бы выдумкой: у DeepSeek цена вне пика вдвое ниже, а пик
+    занимает лишь 01:00-04:00 и 06:00-10:00 UTC по будням. Модели без тарифа
+    перечисляются поимённо - молча выкинуть их из счёта значит показать
+    стоимость, которой не существует.
+    """
+    items = combined.get("cost") or []
+    if not items:
+        return ""
+    table_rows = []
+    for item in items:
+        off = f'{item["cost_off_peak"]:.4f}' if "cost_off_peak" in item else "—"
+        table_rows.append([item["model"], f'{item["cost"]:.4f}', off,
+                           human(item["input_tokens"]), human(item["cache_read_tokens"]),
+                           human(item["output_tokens"])])
+    per_session = combined.get("cost_per_session")
+    per_session_off = combined.get("cost_per_session_off_peak")
+    per_line = ""
+    if per_session is not None:
+        per_line = (f'<div class="muted">на задачу (сессию): {per_session:.4f} USD (пик) … '
+                    f'{per_session_off:.4f} USD (вне пика)</div>')
+    unpriced = combined.get("cost_unpriced_models") or []
+    unpriced_line = (f'<p class="muted">без тарифа и потому не в счёте: '
+                     f'{html.escape(", ".join(unpriced))}</p>' if unpriced else "")
+    return f"""
+        <section>
+          <h2>Стоимость <span class="muted">по тарифам владельца</span></h2>
+          <div class="cards">
+            <div class="card"><div class="k">за окно, пик</div>
+              <div class="v">{combined['cost_total']:.2f} USD</div>{per_line}</div>
+            <div class="card"><div class="k">за окно, вне пика</div>
+              <div class="v">{combined['cost_total_off_peak']:.2f} USD</div>
+              <div class="muted">вне пика вдвое дешевле</div></div>
+          </div>
+          {rows([["модель", "USD пик", "USD вне пика", "вход", "кэш", "выход"]] + table_rows)}
+          {unpriced_line}
+        </section>"""
+
+
 def render_page(payload: dict, hours: float) -> str:
     hermes, sqz, jev, combined = payload["hermes"], payload["sqz"], payload["jev"], payload["combined"]
     plugin = payload.get("sqz_plugin") or {"available": False}
@@ -158,6 +199,10 @@ def render_page(payload: dict, hours: float) -> str:
         </section>""")
     else:
         sections.append(f'<section><h2>Hermes</h2><p class="muted">нет базы {html.escape(hermes.get("path", ""))}</p></section>')
+
+    # 1b. Стоимость: тарифы владельца превращают токены в деньги
+    if combined.get("prices_configured"):
+        sections.append(cost_block(combined, hermes))
 
     # 2. Сжатие
     if sqz.get("available"):

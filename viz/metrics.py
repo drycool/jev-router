@@ -458,6 +458,41 @@ def estimate_cost(tokens: dict, price: dict) -> float | None:
     return round(total, 4)
 
 
+def estimate_cost_off_peak(tokens: dict, price: dict) -> float | None:
+    """Тот же расчёт по внепиковому тарифу, если он задан.
+
+    У DeepSeek цена вне пика вдвое ниже, а пик занимает лишь 01:00-04:00 и
+    06:00-10:00 UTC по будням, то есть около 7 часов из 24 и ноль в выходные.
+    Одно число здесь было бы выдумкой: замер идёт по сессиям, а сессия может
+    пересекать границу тарифа, поэтому показываем обе границы - верхнюю
+    (пиковую) и нижнюю (внепиковую).
+    """
+    off_peak = (price or {}).get("off_peak")
+    if not isinstance(off_peak, dict):
+        return None
+    return estimate_cost(tokens, off_peak)
+
+
+def price_for(prices: dict, model: str) -> dict | None:
+    """Тариф для имени модели, включая длинные имена моделей-файлов.
+
+    Точный ключ, потом имя после префикса поверхности (`cli/`), потом
+    вхождение: имя вида `/home/dry/llama.cpp/models/qwen2.5-3b-instruct-q5_k_m.gguf`
+    после отрезания первого слэша не совпадает ни с чем, если хранить его целиком.
+    Из совпадений берётся самое длинное, чтобы `ornith-1.5:9b` не перехватило
+    `ornith-1.5-9b-256k`.
+    """
+    if not prices or not model:
+        return None
+    for key in (model, model.split("/", 1)[-1]):
+        if key in prices:
+            return prices[key]
+    matches = [key for key in prices if key and key in model]
+    if not matches:
+        return None
+    return prices[max(matches, key=len)]
+
+
 def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = SQZ_DB,
               jev_dir: Path = JEV_DIR, plugin_log: Path = PLUGIN_LOG) -> dict:
     """Одна страница данных: три источника плюс то, ради чего они вместе.
@@ -479,12 +514,33 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
         "cache_read_tokens": sum(session["cache_read_tokens"]
                                  for session in hermes.get("sessions", [])),
     }
-    cost_by_model = []
+    cost_by_model: list[dict] = []
+    unpriced: list[str] = []
     for bucket in hermes.get("by_model", []):
-        price = prices.get(bucket["model"].split("/", 1)[-1]) or prices.get(bucket["model"])
-        cost = estimate_cost(bucket, price) if price else None
-        if cost is not None:
-            cost_by_model.append({"model": bucket["model"], "cost": cost})
+        price = price_for(prices, bucket["model"])
+        if price is None:
+            # Модель без тарифа называется вслух: молча выкинуть её из счёта
+            # значит показать стоимость, которой не существует.
+            unpriced.append(bucket["model"])
+            continue
+        cost = estimate_cost(bucket, price)
+        if cost is None:
+            unpriced.append(bucket["model"])
+            continue
+        entry = {"model": bucket["model"], "cost": cost,
+                 "sessions": bucket.get("sessions", 0),
+                 "input_tokens": bucket.get("input_tokens", 0),
+                 "output_tokens": bucket.get("output_tokens", 0),
+                 "cache_read_tokens": bucket.get("cache_read_tokens", 0)}
+        off_peak = estimate_cost_off_peak(bucket, price)
+        if off_peak is not None:
+            entry["cost_off_peak"] = off_peak
+        cost_by_model.append(entry)
+    cost_by_model.sort(key=lambda item: -item["cost"])
+    cost_total = round(sum(item["cost"] for item in cost_by_model), 4)
+    # Верхняя граница - пиковый тариф, нижняя - внепиковый (там, где он есть).
+    cost_total_off_peak = round(sum(item.get("cost_off_peak", item["cost"]) for item in cost_by_model), 4)
+    spent_sessions = len(hermes.get("sessions", []))
 
     return {
         "window_hours": hours,
@@ -523,6 +579,15 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
             "plugin_saving_percent": plugin.get("saving_percent", 0),
             "plugin_useful_share": plugin.get("useful_share_percent", 0),
             "cost": cost_by_model,
+            "cost_total": cost_total,
+            "cost_total_off_peak": cost_total_off_peak,
+            "cost_unpriced_models": unpriced,
+            # Цена «за задачу»: делим на сессии с расходом, потому что задача в
+            # этих данных и есть сессия - другого знаменателя в базе нет.
+            "cost_per_session": round(cost_total / spent_sessions, 4) if spent_sessions else None,
+            "cost_per_session_off_peak": (round(cost_total_off_peak / spent_sessions, 4)
+                                          if spent_sessions else None),
+            "cost_currency": prices.get("_currency", "USD") if isinstance(prices, dict) else "USD",
             "prices_configured": bool(prices),
         },
         "notes": [

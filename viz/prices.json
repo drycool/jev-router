@@ -1,0 +1,67 @@
+{
+  "updated_at": "2026-09-28",
+  "currency": "USD",
+  "unit": "USD за 1 000 000 токенов",
+  "_why": "Тарифы сняты с ЖИВОЙ страницы вендора, а не из ответа чат-модели. Ссылки и дата снятия ниже; для каждой строки указано, откуда взяты числа. Модели, тариф которых неизвестен, в файл не попали: выдуманный тариф хуже отсутствующего, дашборд честно покажет их как неоценённые.",
+  "sources": {
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing — снято 28.09.2026",
+    "google": "снимок таблицы Hermes agent/usage_pricing.py (ai.google.dev/pricing, версия 2026-07-07)"
+  },
+  "peak_hours_utc": "Пик: 01:00-04:00 и 06:00-10:00 UTC, понедельник-пятница. Всё остальное время, включая выходные целиком, — вне пика, и цены там ВДВОЕ ниже. В `models` лежат ПИКОВЫЕ цены (верхняя оценка), внепиковые — в `off_peak`.",
+  "free_tier": "Тариф Token Harbor бесплатный (баланс $0, доступны только :free-модели), поэтому ноль у deepseek-v4.1-flash:free — это факт, а не отсутствие данных. Нули у ornith/qwen/spark/gguf — локальные модели, они не тарифицируются вовсе.",
+  "aliases": {
+    "deepseek-v4-flash": "устаревшее имя, запросы обслуживает DeepSeek-V4.1-Flash по цене Flash (сноска 1 на странице вендора)",
+    "deepseek-chat": "устаревшее имя (с 24.07.2026), теперь режим без размышлений модели Flash",
+    "deepseek-reasoner": "устаревшее имя (с 24.07.2026), теперь режим с размышлениями модели Flash"
+  },
+  "models": {
+    "deepseek-v4-flash": {
+      "input": 0.3,
+      "cache_read": 0.006,
+      "output": 1.2,
+      "off_peak": { "input": 0.15, "cache_read": 0.003, "output": 0.6 }
+    },
+    "deepseek-flash": {
+      "input": 0.3,
+      "cache_read": 0.006,
+      "output": 1.2,
+      "off_peak": { "input": 0.15, "cache_read": 0.003, "output": 0.6 }
+    },
+    "deepseek-chat": {
+      "input": 0.3,
+      "cache_read": 0.006,
+      "output": 1.2,
+      "off_peak": { "input": 0.15, "cache_read": 0.003, "output": 0.6 }
+    },
+    "deepseek-reasoner": {
+      "input": 0.3,
+      "cache_read": 0.006,
+      "output": 1.2,
+      "off_peak": { "input": 0.15, "cache_read": 0.003, "output": 0.6 }
+    },
+    "deepseek-v4-pro": {
+      "input": 1.32,
+      "cache_read": 0.044,
+      "output": 3.96,
+      "off_peak": { "input": 0.66, "cache_read": 0.022, "output": 1.98 }
+    },
+
+    "gemini-3.1-flash-lite-preview": { "input": 0.25, "cache_read": 0.025, "output": 1.5 },
+    "gemini-3.1-flash-lite": { "input": 0.25, "cache_read": 0.025, "output": 1.5 },
+    "gemini-3-flash-preview": { "input": 0.5, "cache_read": 0.05, "output": 3.0 },
+
+    "ornith-1.5-9b-256k": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "ornith-1.5-9b-256k:latest": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "ornith-1.5:9b": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "ornith-1.5-35b-256k": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "spark-x2.5-4b": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "qwen2.5-3b-instruct-q5_k_m.gguf": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "LFM2.5-2.6B-Q4_K_M.gguf": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "qwen3:8b": { "input": 0.0, "cache_read": 0.0, "output": 0.0 },
+    "deepseek-v4.1-flash:free": { "input": 0.0, "cache_read": 0.0, "output": 0.0 }
+  },
+  "unpriced": {
+    "minimax-m3": "облачная, но неизвестно, через какого посредника шли запросы: цена в таблице Hermes относится к Fireworks, а наш маршрут не подтверждён",
+    "default": "имя-заглушка (0.16млн вход / 27.8млн кэш), под ним может быть любая модель"
+  }
+}

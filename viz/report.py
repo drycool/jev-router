@@ -112,7 +112,21 @@ def show(payload: dict) -> None:
     print(f"  экономия sqz:                         {human_size(combined['sqz_saved_tokens'])} токенов "
           f"({combined['sqz_saving_percent']}%)")
     if combined["prices_configured"]:
-        print(f"  стоимость: {combined['cost']}")
+        print(f"  стоимость за окно: {combined['cost_total']:.2f} USD (пик) … "
+              f"{combined['cost_total_off_peak']:.2f} USD (вне пика)")
+        sessions = len(hermes.get("sessions", []))
+        if combined.get("cost_per_session") is not None and sessions:
+            print(f"  на задачу (сессию, их {sessions}): {combined['cost_per_session']:.4f} USD (пик) … "
+                  f"{combined['cost_per_session_off_peak']:.4f} USD (вне пика)")
+        for item in combined["cost"]:
+            tail = ""
+            if "cost_off_peak" in item:
+                tail = f" … {item['cost_off_peak']:.4f} (вне пика)"
+            print(f"    {item['model'][:38]:<38} {item['cost']:>9.4f} USD{tail}"
+                  f"   вход {human_size(item['input_tokens'])} / кэш "
+                  f"{human_size(item['cache_read_tokens'])} / выход {human_size(item['output_tokens'])}")
+        if combined["cost_unpriced_models"]:
+            print(f"  без тарифа, в счёт не вошли: {', '.join(combined['cost_unpriced_models'])}")
     else:
         print("  стоимость: нет viz/prices.json - считаются только токены")
     print("\n── КАК ЭТО ЧИТАТЬ ────────────────────────────────────────────────────")
