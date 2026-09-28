@@ -33,6 +33,7 @@ def show(payload: dict) -> None:
     print(f"окно: {label}    сформировано {payload['generated_at'][:19]}Z\n")
 
     hermes, sqz, jev = payload["hermes"], payload["sqz"], payload["jev"]
+    plugin = payload.get("sqz_plugin") or {}
     combined = payload["combined"]
 
     print("── ЧТО УШЛО В ОБЛАКО (Hermes) ─────────────────────────────────────────")
@@ -71,6 +72,22 @@ def show(payload: dict) -> None:
                   f"{human_size(day['tokens_before']):>8}  экономия "
                   f"{human_size(day['saved']):>7} ({day['saving_percent']}%)  "
                   f"пустых {day['no_op_share']}%")
+
+    print("\n── ЧТО ПЛАГИН СДЕЛАЛ С ТЕКСТОМ (журнал решений) ───────────────────────")
+    if not plugin.get("available"):
+        print(f"  журнала нет: {plugin.get('path')} — {plugin.get('hint', '')}")
+    else:
+        print(f"  попыток {plugin['attempts']}, удачных сжатий {plugin['compressed']} "
+              f"({plugin['useful_share_percent']}%)")
+        print(f"  символов {human_size(plugin['chars_in'])} -> {human_size(plugin['chars_out'])}, "
+              f"экономия {plugin['saving_percent']}%  (токенов "
+              f"{human_size(plugin['tokens_in'])} -> {human_size(plugin['tokens_out'])})")
+        print(f"  решения: {plugin['actions']}")
+        for row in plugin["by_tool"]:
+            print(f"    {row['tool'][:22]:<22} попыток {row['attempts']:>4}  сжато "
+                  f"{row['compressed']:>4} ({row['useful_share']:>5}%)  "
+                  f"{human_size(row['chars_in']):>8} -> {human_size(row['chars_out']):>8}  "
+                  f"{row['saving_percent']}%")
 
     print("\n── ЧТО БАЗА ОТВЕТИЛА САМА (Jev) ──────────────────────────────────────")
     if not jev.get("available"):

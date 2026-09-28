@@ -46,6 +46,12 @@ from typing import Iterable, Sequence
 # инструмент не должен требовать правки кода, чтобы посмотреть на другой стенд.
 HERMES_DB = Path(os.getenv("JEV_VIZ_HERMES_DB", "~/.hermes/state.db")).expanduser()
 SQZ_DB = Path(os.getenv("JEV_VIZ_SQZ_DB", "~/.sqz/sessions.db")).expanduser()
+# Журнал самого плагина sqz: он пишет по строке на КАЖДОЕ решение, включая
+# отказы. База sqz показывает только состоявшиеся сжатия и потому льстит себе:
+# из неё видно «16.3% экономии», но не видно ни 15% выводов, которые сжатие
+# раздуло, ни того, что 68% сжатий не дали ничего.
+PLUGIN_LOG = Path(os.getenv("JEV_VIZ_SQZ_PLUGIN_LOG",
+                            "~/.hermes/logs/sqz_plugin.jsonl")).expanduser()
 JEV_DIR = Path(os.getenv("JEV_VIZ_JEV_DIR", str(Path(__file__).resolve().parents[1]))).expanduser()
 PRICES_FILE = Path(__file__).resolve().parent / "prices.json"
 
@@ -258,6 +264,75 @@ def sqz_summary(hours: float = 24.0, path: Path = SQZ_DB) -> dict:
 
 # ── Jev: что база ответила сама ──────────────────────────────────────────────────────
 
+def sqz_plugin_summary(hours: float = 24.0, path: Path = PLUGIN_LOG) -> dict:
+    """Что плагин sqz сделал на самом деле: по строке журнала на каждое решение.
+
+    Отличие от `sqz_summary`, которое здесь и есть смысл: база sqz хранит только
+    состоявшиеся сжатия. Журнал плагина хранит и отказы - `no_gain` (сжатие
+    раздуло текст или не дотянуло до порога), `tool_not_listed` (инструмент вне
+    белого списка), `no_payload` (в конверте нет текста), `error`, `timeout`.
+    Поэтому доля полезных сжатий здесь считается от ПОПЫТОК, а не от успехов.
+    """
+    if not path.exists():
+        return {"available": False, "path": str(path),
+                "hint": "журнал появится после первого вызова инструмента плагином v2"}
+    since = _since(hours).timestamp()
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if float(row.get("ts") or 0) >= since:
+            rows.append(row)
+
+    per_tool: dict[str, dict] = {}
+    actions = Counter()
+    chars_in = chars_out = tokens_in = tokens_out = 0
+    compressed = refs = 0
+    for row in rows:
+        action = str(row.get("action") or "?")
+        actions[action] += 1
+        tool = str(row.get("tool") or "?")
+        bucket = per_tool.setdefault(tool, {"tool": tool, "attempts": 0, "compressed": 0,
+                                            "chars_in": 0, "chars_out": 0,
+                                            "tokens_in": 0, "tokens_out": 0})
+        bucket["attempts"] += 1
+        if action in ("compressed", "dedup_ref"):
+            compressed += 1
+            bucket["compressed"] += 1
+            refs += 1 if action == "dedup_ref" else 0
+            for key, value in (("chars_in", row.get("chars_in")), ("chars_out", row.get("chars_out")),
+                               ("tokens_in", row.get("tokens_in")), ("tokens_out", row.get("tokens_out"))):
+                bucket[key] += int(value or 0)
+            chars_in += int(row.get("chars_in") or 0)
+            chars_out += int(row.get("chars_out") or 0)
+            tokens_in += int(row.get("tokens_in") or 0)
+            tokens_out += int(row.get("tokens_out") or 0)
+    for bucket in per_tool.values():
+        bucket["saving_percent"] = percent(bucket["chars_in"] - bucket["chars_out"], bucket["chars_in"])
+        bucket["useful_share"] = percent(bucket["compressed"], bucket["attempts"])
+
+    return {
+        "available": True,
+        "path": str(path),
+        "window_hours": hours,
+        "attempts": len(rows),
+        "compressed": compressed,
+        "refs": refs,
+        "useful_share_percent": percent(compressed, len(rows)),
+        "chars_in": chars_in,
+        "chars_out": chars_out,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "saving_percent": percent(chars_in - chars_out, chars_in),
+        "actions": dict(actions.most_common()),
+        "by_tool": sorted(per_tool.values(), key=lambda row: -row["chars_in"]),
+    }
+
+
 def jev_summary(hours: float = 24.0, directory: Path = JEV_DIR) -> dict:
     """Решения роутера: тиры, задержки, вердикты, причины отказа — и обратная связь."""
     path = Path(directory) / "jev_decisions.jsonl"
@@ -384,7 +459,7 @@ def estimate_cost(tokens: dict, price: dict) -> float | None:
 
 
 def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = SQZ_DB,
-              jev_dir: Path = JEV_DIR) -> dict:
+              jev_dir: Path = JEV_DIR, plugin_log: Path = PLUGIN_LOG) -> dict:
     """Одна страница данных: три источника плюс то, ради чего они вместе.
 
     Главная производная - сопоставление: сколько запросов база закрыла сама и сколько
@@ -393,6 +468,7 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
     """
     hermes = hermes_summary(hours, hermes_db)
     sqz = sqz_summary(hours, sqz_db)
+    plugin = sqz_plugin_summary(hours, plugin_log)
     jev = jev_summary(hours, jev_dir)
     prices = load_prices()
 
@@ -415,6 +491,7 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "hermes": hermes,
         "sqz": sqz,
+        "sqz_plugin": plugin,
         "jev": jev,
         "combined": {
             "cloud_calls": cloud_calls,
@@ -439,14 +516,21 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
                                            tokens["cache_read_tokens"] + tokens["input_tokens"]),
             "sqz_saved_tokens": sqz.get("saved", 0),
             "sqz_saving_percent": sqz.get("saving_percent", 0),
+            # Цифры плагина считаются от попыток, а не от успехов: отказ тоже
+            # результат, и без него «экономия» выглядит лучше, чем есть.
+            "plugin_attempts": plugin.get("attempts", 0),
+            "plugin_compressed": plugin.get("compressed", 0),
+            "plugin_saving_percent": plugin.get("saving_percent", 0),
+            "plugin_useful_share": plugin.get("useful_share_percent", 0),
             "cost": cost_by_model,
             "prices_configured": bool(prices),
         },
         "notes": [
             "Токены считаются по сессиям Hermes (в сообщениях счётчиков нет), поэтому ряд "
             "по дням строится из событий: вызовы модели, запросы Jev, сжатия sqz.",
-            "sqz в плагине Hermes работает с --no-cache: дедуп-ссылки отключены, поэтому "
-            "повторяющийся текст не сжимается и часть сжатий не даёт ничего.",
+            "Сжатие sqz идёт от попыток, а не от удач: сжатие, которое раздуло текст или "
+            "не дотянуло до порога 10%, отбрасывается, и это видно в журнале плагина как "
+            "no_gain. Процент экономии без этой цифры льстит себе.",
             "Цифра «доля локальных ответов» - про запросы к базе, а не про шаги агента: "
             "агент может спросить базу и всё равно позвать модель.",
             "Запросы разделены на ответы и пробы: проба (execute=false) материал не отдаёт "

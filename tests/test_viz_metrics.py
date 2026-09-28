@@ -12,13 +12,15 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from viz.metrics import dashboard, hermes_summary, jev_summary, percent, percentile, sqz_summary  # noqa: E402
+from viz.metrics import (dashboard, hermes_summary, jev_summary, percent, percentile,  # noqa: E402
+                         sqz_plugin_summary, sqz_summary)
 from viz.server import render_page  # noqa: E402
 
 
@@ -256,3 +258,78 @@ class AnswersVersusProbesTest(unittest.TestCase):
         self.assertEqual(summary["answers"], 2)
         self.assertEqual(summary["probes"], 1)
         self.assertEqual(summary["local_answers"], 2)
+
+
+class SqzPluginJournalTest(unittest.TestCase):
+    """Журнал плагина sqz: экономия считается от ПОПЫТОК, а не от удач.
+
+    База sqz хранит только состоявшиеся сжатия, поэтому «16.3% экономии» ничего не
+    говорит о том, чего стоило сжатие.  В журнале плагина лежат и отказы, и вопрос
+    «сколько попыток дали пользу» получает честный знаменатель.
+    """
+
+    def _rows(self, directory: Path, now: float) -> Path:
+        path = directory / "sqz_plugin.jsonl"
+        rows = [
+            {"ts": now, "tool": "terminal", "action": "compressed", "chars_in": 1000,
+             "chars_out": 250, "tokens_in": 500, "tokens_out": 120, "saving_percent": 75.0},
+            {"ts": now, "tool": "terminal", "action": "no_gain", "chars_in": 900, "chars_out": 900},
+            {"ts": now, "tool": "read_file", "action": "tool_not_listed", "chars_in": 4000},
+            {"ts": now, "tool": "execute_code", "action": "compressed", "chars_in": 2000,
+             "chars_out": 1000, "tokens_in": 900, "tokens_out": 450, "saving_percent": 50.0},
+            {"ts": now - 10 * 86400, "tool": "terminal", "action": "compressed",
+             "chars_in": 8000, "chars_out": 100},
+        ]
+        path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+        return path
+
+    def test_share_is_counted_from_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._rows(root, time.time())
+            summary = sqz_plugin_summary(hours=24, path=path)
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["attempts"], 4)          # старая запись вне окна
+        self.assertEqual(summary["compressed"], 2)
+        self.assertEqual(summary["useful_share_percent"], 50.0)
+        self.assertEqual(summary["saving_percent"], 58.3)  # 3000 -> 1250
+        self.assertEqual(summary["actions"]["tool_not_listed"], 1)
+        tools = {row["tool"]: row for row in summary["by_tool"]}
+        self.assertEqual(tools["execute_code"]["compressed"], 1)
+        self.assertEqual(tools["read_file"]["attempts"], 1)
+        self.assertEqual(tools["read_file"]["chars_in"], 0)   # отказ не входит в объём
+
+    def test_all_time_window_includes_everything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._rows(Path(directory), time.time())
+            summary = sqz_plugin_summary(hours=0, path=path)
+        self.assertEqual(summary["attempts"], 5)
+        self.assertEqual(len(summary["by_tool"]), 3)
+
+    def test_missing_journal_says_so_instead_of_inventing_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary = sqz_plugin_summary(hours=24, path=Path(directory) / "нет.jsonl")
+        self.assertFalse(summary["available"])
+        self.assertIn("журнал", summary["hint"])
+
+    def test_broken_line_does_not_break_the_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sqz_plugin.jsonl"
+            path.write_text('{"ts": %f, "tool": "terminal", "action": "compressed", "chars_in": 100, "chars_out": 10}\n'
+                            'не json\n' % time.time(), encoding="utf-8")
+            summary = sqz_plugin_summary(hours=0, path=path)
+        self.assertEqual(summary["attempts"], 1)
+
+    def test_page_shows_plugin_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._rows(root, time.time())
+            # Страница собирается из настоящего `dashboard`, а не из собранного
+            # руками словаря: иначе тест проверяет выдумку и падает на первом же
+            # ключе, который появился в шаблоне позже.
+            payload = dashboard(hours=24, hermes_db=root / "нет.db", sqz_db=root / "нет.db",
+                                jev_dir=root, plugin_log=path)
+            page = render_page(payload, 24)
+        self.assertIn("Плагин sqz", page)
+        self.assertIn("попыток сжатия", page)
+        self.assertIn("execute_code", page)

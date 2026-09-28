@@ -62,12 +62,48 @@ def sparkline(values: list[float], width: int = 240, height: int = 40, colour: s
 
 
 def rows(table: list[list[str]]) -> str:
-    body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in table)
-    return f'<table>{body}</table>'
+    head, *body = table
+    cells = "".join(f"<th>{html.escape(str(value))}</th>" for value in head)
+    lines = "".join("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in row) + "</tr>"
+                    for row in body)
+    return f'<table><thead><tr>{cells}</tr></thead><tbody>{lines}</tbody></table>'
+
+
+def plugin_block(plugin: dict) -> str:
+    """Цифры плагина sqz: от попыток, а не от удач.
+
+    База sqz хранит только состоявшиеся сжатия и потому показывает экономию без
+    знаменателя. Журнал плагина хранит и отказы (`no_gain` - сжатие раздуло текст
+    или не дотянуло до порога, `tool_not_listed` - инструмент вне белого списка),
+    поэтому доля полезных сжатий здесь честная.
+    """
+    if not plugin.get("available"):
+        return (f'<h3>Плагин sqz</h3><p class="muted">журнала нет: '
+                f'{html.escape(plugin.get("path", ""))} — '
+                f'{html.escape(plugin.get("hint", ""))}</p>')
+    actions = " · ".join(f"{name} {count}" for name, count in (plugin.get("actions") or {}).items())
+    tool_rows = [[row["tool"], str(row["attempts"]), str(row["compressed"]),
+                  f'{row["useful_share"]}%', human(row["chars_in"]), human(row["chars_out"]),
+                  f'{row["saving_percent"]}%'] for row in plugin.get("by_tool", [])]
+    return f"""
+          <h3>Плагин sqz <span class="muted">версия с журналом решений</span></h3>
+          <div class="cards">
+            <div class="card"><div class="k">попыток сжатия</div><div class="v">{plugin['attempts']}</div>
+              <div class="muted">удачных {plugin['compressed']} ({plugin['useful_share_percent']}%)</div></div>
+            <div class="card"><div class="k">экономия</div><div class="v">{plugin['saving_percent']}%</div>
+              <div class="muted">{human(plugin['chars_in'] - plugin['chars_out'])} символов</div></div>
+            <div class="card"><div class="k">символов</div>
+              <div class="v">{human(plugin['chars_in'])} → {human(plugin['chars_out'])}</div>
+              <div class="muted">токенов {human(plugin['tokens_in'])} → {human(plugin['tokens_out'])}</div></div>
+          </div>
+          <p class="muted">решения: {html.escape(actions or "нет")}</p>
+          {rows([["инструмент", "попыток", "сжато", "доля", "вход", "выход", "%"]] + tool_rows)
+           if tool_rows else ""}"""
 
 
 def render_page(payload: dict, hours: float) -> str:
     hermes, sqz, jev, combined = payload["hermes"], payload["sqz"], payload["jev"], payload["combined"]
+    plugin = payload.get("sqz_plugin") or {"available": False}
     links = " ".join(
         f'<a class="{"on" if label_hours == hours else ""}" href="/?hours={label_hours}">{label}</a>'
         for label, label_hours in WINDOWS)
@@ -136,9 +172,15 @@ def render_page(payload: dict, hours: float) -> str:
           {rows([["день", "сжатий", "вход", "экономия", "%", "пустых"]] + day_rows)}
           <h3>Крупнейшие сжатия</h3>
           {rows([["id", "до", "после", "когда", "каталог"]] + biggest)}
+          {plugin_block(plugin)}
         </section>""")
     else:
-        sections.append(f'<section><h2>sqz</h2><p class="muted">нет стора {html.escape(sqz.get("path", ""))}</p></section>')
+        # Журнал плагина - отдельный источник: он есть даже когда база sqz
+        # недоступна, и прятать его вместе с базой значит терять единственные
+        # честные цифры сжатия.
+        sections.append(f'<section><h2>Сжатие <span class="muted">sqz</span></h2>'
+                        f'<p class="muted">нет стора {html.escape(sqz.get("path", ""))}</p>'
+                        f'{plugin_block(plugin)}</section>')
 
     # 3. Что база ответила сама
     if jev.get("available"):
@@ -202,9 +244,9 @@ def render_page(payload: dict, hours: float) -> str:
  .card .v {{ font-size:1.35rem; font-weight:600; }}
  .spark {{ margin:.4rem 0 .2rem; }}
  table {{ border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }}
- td {{ padding:.28rem .5rem; border-bottom:1px solid #21262d; }}
- tr:first-child td {{ color:#8b949e; font-size:.8rem; text-transform:uppercase;
-                      letter-spacing:.04em; }}
+ td, th {{ padding:.28rem .5rem; border-bottom:1px solid #21262d; text-align:left; }}
+ thead th, tr:first-child td {{ color:#8b949e; font-size:.8rem; text-transform:uppercase;
+                     letter-spacing:.04em; font-weight:400; }}
  .bar {{ vertical-align:middle; }}
  ul {{ margin:0; padding-left:1.2rem; color:#8b949e; }}
 </style></head><body>
