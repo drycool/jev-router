@@ -279,14 +279,29 @@ def jev_summary(hours: float = 24.0, directory: Path = JEV_DIR) -> dict:
 
     per_day: dict[str, dict] = {}
     latencies, tiers, blocked, strategies = [], Counter(), Counter(), Counter()
+    answered = 0
+    local_answers = 0
     for record in decisions:
         decision = record.get("decision") or {}
         execution = record.get("execution") or {}
+        signals = record.get("signals") or {}
+        # Ответ от пробы отличается тем, что проба не отдаёт материал: `execute=false`
+        # (`answer_chars` пусто) - это замер, а не работа агента.  Без этого разделения
+        # калибровочные прогоны выглядят как использование базы, и главная цифра отчёта
+        # («доля локальных ответов») описывает маршрутизатор, а не поведение агента.
+        is_answer = bool(signals.get("answered")) or (signals.get("answer_chars") or 0) > 0
+        answered += 1 if is_answer else 0
         strategy = str(decision.get("strategy") or "?")
+        # Пересечение двух признаков, а не отношение двух итогов: «локально» считается по
+        # тирам среди всех записей, «ответы» - другое подмножество, и их отношение дало бы
+        # больше 100% (проверено на живых данных: 869.6%).
+        if is_answer and strategy in LOCAL_TIERS:
+            local_answers += 1
         day = _day(record.get("timestamp"))
-        bucket = per_day.setdefault(day, {"day": day, "requests": 0, "local": 0, "partial": 0,
-                                          "model": 0, "latency_ms": []})
+        bucket = per_day.setdefault(day, {"day": day, "requests": 0, "answers": 0, "local": 0,
+                                          "partial": 0, "model": 0, "latency_ms": []})
         bucket["requests"] += 1
+        bucket["answers"] += 1 if is_answer else 0
         if strategy in LOCAL_TIERS:
             bucket["local"] += 1
         elif strategy in PARTIAL_TIERS:
@@ -324,6 +339,10 @@ def jev_summary(hours: float = 24.0, directory: Path = JEV_DIR) -> dict:
         "path": str(path),
         "window_hours": hours,
         "requests": len(decisions),
+        # Сколько из них отдали материал, а сколько было пробами (execute=false).
+        "answers": answered,
+        "local_answers": local_answers,
+        "probes": len(decisions) - answered,
         "tiers": dict(tiers.most_common()),
         "local": sum(count for tier, count in tiers.items() if tier in LOCAL_TIERS),
         "partial": sum(count for tier, count in tiers.items() if tier in PARTIAL_TIERS),
@@ -403,6 +422,12 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
             "jev_local": jev.get("local", 0),
             "jev_partial": jev.get("partial", 0),
             "local_share_percent": percent(jev.get("local", 0), jev.get("requests", 0)),
+            # Доля локальных ответов, посчитанная только по настоящим ответам: цифра про
+            # маршрутизатор считается по всем запросам, цифра про агента - по ответам.
+            "local_share_of_answers": percent(jev.get("local_answers", 0), jev.get("answers", 0)),
+            "jev_local_answers": jev.get("local_answers", 0),
+            "jev_answers": jev.get("answers", 0),
+            "jev_probes": jev.get("probes", 0),
             # Вызовов модели на один запрос к базе.  Обратное отношение (0.25) читается
             # как «четверть вызова на запрос» и путает: смысл в том, сколько раз агент
             # всё равно пошёл в облако, имея базу под рукой.
@@ -424,6 +449,9 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
             "повторяющийся текст не сжимается и часть сжатий не даёт ничего.",
             "Цифра «доля локальных ответов» - про запросы к базе, а не про шаги агента: "
             "агент может спросить базу и всё равно позвать модель.",
+            "Запросы разделены на ответы и пробы: проба (execute=false) материал не отдаёт "
+            "и работой агента не является - калибровочные прогоны иначе выглядят как "
+            "использование базы.",
             "Стоимость не показывается, пока нет viz/prices.json с тарифами владельца: "
             "цены зависят от тарифа, а выдуманный тариф хуже отсутствующего.",
         ],

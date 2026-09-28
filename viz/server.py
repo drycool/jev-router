@@ -155,6 +155,10 @@ def render_page(payload: dict, hours: float) -> str:
             <div class="card"><div class="k">локально</div>
               <div class="v">{combined['local_share_percent']}%</div>
               <div class="muted">{jev['local']} из {jev['requests']}</div></div>
+            <div class="card"><div class="k">ответов / проб</div>
+              <div class="v">{jev['answers']} / {jev['probes']}</div>
+              <div class="muted">проба = замер, не работа агента · локально из ответов
+                {combined['local_share_of_answers']}%</div></div>
             <div class="card"><div class="k">материал без вердикта</div><div class="v">{jev['partial']}</div>
               <div class="muted">вызывающий решает сам</div></div>
             <div class="card"><div class="k">через модель</div><div class="v">{jev['model']}</div>
@@ -206,7 +210,8 @@ def render_page(payload: dict, hours: float) -> str:
 </style></head><body>
 <h1>Jev + sqz + Hermes: что стало дешевле</h1>
 <div class="muted">окно: {"всё время" if hours <= 0 else f"последние {hours:g} ч"} · сформировано {payload['generated_at'][:19]}Z
- · запросов к базе {jev.get('requests', 0)}, из них локально {combined['local_share_percent']}%
+ · запросов к базе {jev.get('requests', 0)} ({jev.get('answers', 0)} ответов, {jev.get('probes', 0)} проб),
+из них локально {combined['local_share_percent']}%
  · облачных вызовов {combined['cloud_calls']} · кэш {combined['cache_share_percent']}%
  · sqz сэкономил {human(combined['sqz_saved_tokens'])} токенов ({combined['sqz_saving_percent']}%)</div>
 <nav>{links} <a href="/api/metrics?hours={hours:g}">JSON</a></nav>

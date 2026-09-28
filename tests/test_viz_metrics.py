@@ -223,3 +223,36 @@ class PageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnswersVersusProbesTest(unittest.TestCase):
+    """Проба (``execute=false``) - замер, а не работа агента.
+
+    Без этого разделения калибровочные прогоны выглядят как использование базы: на этой
+    машине 660 из 716 записей - пробы, и «68% локальных ответов» описывает маршрутизатор,
+    а не поведение агента.  Цифра, которая описывает не то, что кажется, хуже отсутствующей.
+    """
+
+    def test_requests_are_split_into_answers_and_probes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Jev"
+            root.mkdir(parents=True)
+            stamp = "2099-01-01T00:00:0"
+            records = [
+                {"timestamp": stamp + "1+00:00", "decision": {"strategy": "exact_fts"},
+                 "signals": {"answered": True, "answer_chars": 900}, "execution": {}},
+                {"timestamp": stamp + "2+00:00", "decision": {"strategy": "vector_fast"},
+                 "signals": {"answered": True, "answer_chars": 0}, "execution": {}},
+                {"timestamp": stamp + "3+00:00", "decision": {"strategy": "vector_fast"},
+                 "signals": {"answered": False, "answer_chars": 0}, "execution": {}},
+            ]
+            (root / "jev_decisions.jsonl").write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in records),
+                encoding="utf-8")
+            summary = jev_summary(hours=0, directory=root)
+        # answered=True считаются ответом даже с пустым текстом: попытка ответа - это
+        # ответ; проба от ответа отличается признаком, а не длиной текста.
+        self.assertEqual(summary["requests"], 3)
+        self.assertEqual(summary["answers"], 2)
+        self.assertEqual(summary["probes"], 1)
+        self.assertEqual(summary["local_answers"], 2)

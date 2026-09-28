@@ -76,7 +76,9 @@ def show(payload: dict) -> None:
     if not jev.get("available"):
         print(f"  нет журнала {jev.get('path')}")
     else:
-        print(f"  запросов {jev['requests']}: локально {jev['local']} "
+        print(f"  запросов {jev['requests']} (ответов {jev['answers']}, проб {jev['probes']}, "
+              f"из ответов локально {combined['local_share_of_answers']}%): "
+              f"локально {jev['local']} "
               f"({combined['local_share_percent']}%), материал без вердикта {jev['partial']}, "
               f"через модель {jev['model']}")
         print(f"  задержка: медиана {jev['median_latency_ms']} мс, p95 {jev['p95_latency_ms']} мс")
