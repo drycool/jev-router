@@ -62,10 +62,22 @@ def sparkline(values: list[float], width: int = 240, height: int = 40, colour: s
 
 
 def rows(table: list[list[str]]) -> str:
+    """Таблица с <thead>. Ячейки экранируются, кроме готовых полос-диаграмм.
+
+    `bar()` возвращает SVG, собранный из чисел внутри самого модуля, а не из
+    данных: экранировать его нельзя, иначе полосы печатаются текстом
+    (`<svg width=...>`), как это и случилось при добавлении <thead> - картинка
+    пропала, а тесты молчали, потому что проверяли текст.
+    """
+    def cell(value: object, tag: str) -> str:
+        text = str(value)
+        if text.lstrip().startswith("<svg"):
+            return f"<{tag}>{text}</{tag}>"
+        return f"<{tag}>{html.escape(text)}</{tag}>"
+
     head, *body = table
-    cells = "".join(f"<th>{html.escape(str(value))}</th>" for value in head)
-    lines = "".join("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in row) + "</tr>"
-                    for row in body)
+    cells = "".join(cell(value, "th") for value in head)
+    lines = "".join("<tr>" + "".join(cell(value, "td") for value in row) + "</tr>" for row in body)
     return f'<table><thead><tr>{cells}</tr></thead><tbody>{lines}</tbody></table>'
 
 

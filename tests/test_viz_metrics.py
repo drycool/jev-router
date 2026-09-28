@@ -21,7 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from viz.metrics import (dashboard, hermes_summary, jev_summary, percent, percentile,  # noqa: E402
                          sqz_plugin_summary, sqz_summary)
-from viz.server import render_page  # noqa: E402
+from viz.server import bar, render_page, rows  # noqa: E402
 
 
 def make_hermes(path: Path) -> Path:
@@ -333,3 +333,23 @@ class SqzPluginJournalTest(unittest.TestCase):
         self.assertIn("Плагин sqz", page)
         self.assertIn("попыток сжатия", page)
         self.assertIn("execute_code", page)
+
+
+class TableRenderingTest(unittest.TestCase):
+    """Экранирование ячеек не должно убивать диаграммы внутри таблиц.
+
+    При добавлении <thead> я экранировал все ячейки подряд, и полосы-диаграммы
+    начали печататься текстом `<svg width=...>`. Тесты этого не заметили, потому
+    что искали текст; картинку нашёл глаз на скриншоте. Поэтому проверяем обе
+    стороны: готовая SVG остаётся разметкой, данные экранируются.
+    """
+
+    def test_bar_survives_and_data_is_escaped(self):
+        page = rows([["тир", "доля"], ["<script>alert(1)</script>", bar(30, 120)]])
+        self.assertIn("<svg", page)
+        self.assertNotIn("&lt;svg", page)
+        self.assertIn("&lt;script&gt;", page)
+
+    def test_header_row_is_a_real_thead(self):
+        page = rows([["a", "b"], ["1", "2"]])
+        self.assertIn("<thead><tr><th>a</th><th>b</th></tr></thead>", page)
