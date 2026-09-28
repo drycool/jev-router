@@ -19,10 +19,35 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from viz.metrics import (dashboard, estimate_cost, estimate_cost_off_peak,  # noqa: E402
-                         hermes_summary, jev_summary, load_prices, percent, percentile,
-                         price_for, sqz_plugin_summary, sqz_summary)
-from viz.server import bar, cost_block, render_page, rows  # noqa: E402
+from viz.metrics import (AGENT_LOG, agent_calls, cold_prefix_summary,  # noqa: E402
+                         dashboard, estimate_cost, estimate_cost_off_peak, hermes_summary,
+                         jev_summary, load_prices, percent, percentile, price_for,
+                         sqz_plugin_summary, sqz_summary)
+from viz.server import bar, cold_block, cost_block, render_page, rows  # noqa: E402
+
+
+def make_agent_log(path: Path) -> Path:
+    """Лог агента: строки ровно того формата, что пишет Hermes.
+
+    Первый запрос сессии всегда холодный (кэш почти ноль), второй и дальше - горячие.
+    Плюс одна сессия с большим первым запросом: это не голова, а перезалив истории.
+    """
+    def call(number: int, day: str, session: str, tokens: int, hit: int) -> str:
+        share = round(100 * hit / tokens) if tokens else 0
+        return (f"15:00:{number:02d} - agent.conversation_loop - INFO [{day}_150000_{session}] - "
+                f"API call #{number}: model=deepseek-v4-flash provider=deepseek in={tokens} "
+                f"out=2 total={tokens + 2} latency=1.8s cache={hit}/{tokens} ({share}%)")
+
+    lines = [
+        call(1, "20260901", "aaaaaa", 22000, 1300),     # холодная голова
+        call(2, "20260901", "aaaaaa", 22100, 21800),    # горячий
+        call(3, "20260901", "aaaaaa", 22200, 22000),    # горячий
+        call(1, "20260902", "bbbbbb", 21000, 1200),     # новая голова - снова холодно
+        call(1, "20260903", "cccccc", 300000, 21000),   # перезалив истории
+        "мусорная строка, которую нельзя принять за вызов",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+    return path
 
 
 def make_hermes(path: Path) -> Path:
@@ -191,8 +216,9 @@ class PageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             payload = dashboard(hours=24, hermes_db=root / "нет.db", sqz_db=root / "нет.db",
-                                jev_dir=root)
+                                jev_dir=root, agent_log=root / "agent.log")
             self.assertFalse(payload["hermes"]["available"])
+            self.assertFalse(payload["cold"]["available"])
             self.assertFalse(payload["sqz"]["available"])
             self.assertFalse(payload["jev"]["available"])
             page = render_page(payload, 24)
@@ -205,8 +231,10 @@ class PageTest(unittest.TestCase):
             root = Path(directory)
             payload = dashboard(hours=0, hermes_db=make_hermes(root / "state.db"),
                                 sqz_db=make_sqz(root / "sessions.db"),
-                                jev_dir=make_jev(root / "Jev"))
+                                jev_dir=make_jev(root / "Jev"),
+                                agent_log=make_agent_log(root / "agent.log"))
             page = render_page(payload, 0)
+            self.assertIn("Холодный старт", page)
             combined = payload["combined"]
             self.assertIn("40.0%", page)                            # доля локальных ответов
             self.assertIn(str(combined["local_share_percent"]), page)
@@ -220,8 +248,11 @@ class PageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             payload = dashboard(hours=24, hermes_db=root / "нет.db", sqz_db=root / "нет.db",
-                                jev_dir=root)
-            self.assertNotIn("Traceback", render_page(payload, 24))
+                                jev_dir=root, agent_log=root / "agent.log")
+            page = render_page(payload, 24)
+            self.assertNotIn("Traceback", page)
+            # Отсутствующий лог агента - это раздел с объяснением, а не пустое место.
+            self.assertIn("нет лога", page)
 
 
 if __name__ == "__main__":
@@ -423,3 +454,90 @@ class CostTest(unittest.TestCase):
 
     def test_cost_block_is_empty_without_prices(self):
         self.assertEqual(cost_block({"cost": []}, {}), "")
+
+
+class ColdStartTest(unittest.TestCase):
+    """Холодный старт: первый запрос сессии против кэша.
+
+    Числа здесь по построению известны, поэтому проверяется именно арифметика:
+    первый запрос платит за голову, второй её читает из кэша, а большой первый
+    запрос - это перезалив истории, а не голова.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.log = make_agent_log(self.root / "agent.log")
+        self.prices = {"deepseek-v4-flash": {"input": 0.30, "cache_read": 0.006,
+                                             "output": 1.20,
+                                             "off_peak": {"input": 0.15, "cache_read": 0.003,
+                                                          "output": 0.60}}}
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_only_real_call_lines_are_parsed(self):
+        calls = agent_calls(self.log)
+        self.assertEqual(len(calls), 5)                       # мусорная строка отброшена
+        self.assertEqual([call["number"] for call in calls], [1, 2, 3, 1, 1])
+        self.assertEqual(calls[0]["day"], "2026-09-01")
+
+    def test_the_first_request_of_a_session_is_the_cold_one(self):
+        cold = cold_prefix_summary(0, self.log, self.prices)
+        by_number = {row["label"]: row for row in cold["by_number"]}
+        self.assertLess(by_number["1"]["share"], by_number["2"]["share"])
+        self.assertGreater(by_number["2"]["share"], 95)
+        # (1300 + 1200 + 21000) из (22000 + 21000 + 300000) токенов
+        self.assertAlmostEqual(by_number["1"]["share"], 6.9, places=1)
+
+    def test_a_big_first_request_is_history_not_the_head(self):
+        cold = cold_prefix_summary(0, self.log, self.prices)
+        self.assertEqual(cold["small"]["calls"], 2)
+        self.assertEqual(cold["big"]["calls"], 1)
+        self.assertEqual(cold["big"]["missed_tokens"], 279000)
+        # Из общего промаха холодного старта почти всё - история, а не голова:
+        # 279000 против 40500 токенов у двух малых первых запросов.
+        self.assertEqual(cold["small"]["missed_tokens"], 40500)
+        self.assertGreater(cold["big"]["missed_tokens"] / 319500, 0.85)
+
+    def test_the_head_is_estimated_from_the_low_quartile(self):
+        cold = cold_prefix_summary(0, self.log, self.prices)
+        # Медиана холодного старта выше головы: в неё входит уже накопленная история.
+        self.assertLess(cold["prefix_low"], cold["prefix_median"])
+        self.assertLess(cold["prefix_low"], 22000)
+
+    def test_the_price_of_a_cold_start_is_missed_tokens_at_the_miss_rate(self):
+        cold = cold_prefix_summary(0, self.log, self.prices)
+        expected = (20700 + 19800 + 279000) * (0.30 - 0.006) / 1e6
+        self.assertAlmostEqual(cold["first_calls"]["tax_peak"], round(expected, 4), places=4)
+        self.assertAlmostEqual(cold["first_calls"]["tax_off_peak"],
+                               round(expected / 2, 4), places=4)
+
+    def test_a_model_without_a_tariff_is_named_not_silently_dropped(self):
+        cold = cold_prefix_summary(0, self.log, {})
+        self.assertEqual(cold["first_calls"]["tax_peak"], 0.0)
+        self.assertEqual(cold["unpriced"], ["deepseek-v4-flash"])
+
+    def test_a_window_that_covers_nothing_says_so(self):
+        # Лог есть, но окно в 1 час его не покрывает: это не «нет лога».
+        cold = cold_prefix_summary(1, self.log, self.prices)
+        self.assertTrue(cold["available"])
+        self.assertFalse(cold["in_window"])
+        self.assertEqual(cold["calls"], 0)
+
+    def test_a_missing_log_is_not_an_error(self):
+        cold = cold_prefix_summary(0, self.root / "нет.log", self.prices)
+        self.assertFalse(cold["available"])
+        self.assertEqual(cold["by_number"], [])
+
+    def test_the_block_says_the_head_is_still_cold(self):
+        page = cold_block(cold_prefix_summary(0, self.log, self.prices))
+        self.assertIn("Холодный старт", page)
+        self.assertIn("перезалив истории", page)
+        # Размер головы и медиана старта - разные числа, и они оба на странице.
+        self.assertIn("21.0тыс", page)
+        self.assertIn("300.0тыс", page)
+
+
+if __name__ == "__main__":
+    unittest.main()

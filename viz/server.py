@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi import FastAPI, Query  # noqa: E402
 from fastapi.responses import HTMLResponse, JSONResponse  # noqa: E402
 
-from viz.metrics import dashboard  # noqa: E402
+from viz.metrics import dashboard, percent  # noqa: E402
 
 WINDOWS = (("24 ч", 24), ("7 дней", 168), ("30 дней", 720), ("всё время", 0))
 
@@ -154,6 +154,68 @@ def cost_block(combined: dict, hermes: dict) -> str:
         </section>"""
 
 
+def cold_block(cold: dict) -> str:
+    """Холодный старт: единственный узел, который реально рождает промахи кэша.
+
+    Первый запрос сессии - единственный, который платит полную цену за голову
+    контекста: замер показал 6% попаданий против 99% у второго запроса. Поэтому
+    здесь два разных числа рядом, и они требуют разных действий: малый первый
+    запрос - это голова (лечится прогревом), большой - перезалив истории
+    (прогревом не лечится вовсе).
+    """
+    if not cold.get("available"):
+        return (f'<section><h2>Холодный старт</h2><p class="muted">нет лога '
+                f'{html.escape(cold.get("path", ""))}</p></section>')
+    if not cold.get("in_window"):
+        return (f'<section><h2>Холодный старт</h2><p class="muted">в этом окне запросов нет; '
+                f'лог покрывает {html.escape(str(cold.get("first_day", "")))} … '
+                f'{html.escape(str(cold.get("last_day", "")))}</p></section>')
+    first = cold.get("first_calls") or {}
+    small, big = cold.get("small") or {}, cold.get("big") or {}
+    number_rows = [[row["label"], str(row["calls"]), human(row["input_tokens"]),
+                    f'{row["share"]}%', bar(row["share"], 100, colour="#d29922")]
+                   for row in cold.get("by_number", [])]
+    split_rows = [
+        [small.get("label", "малые"), str(small.get("calls", 0)), human(small.get("input_tokens", 0)),
+         f'{small.get("share", 0)}%', human(small.get("missed_tokens", 0))],
+        [big.get("label", "большие"), str(big.get("calls", 0)), human(big.get("input_tokens", 0)),
+         f'{big.get("share", 0)}%', human(big.get("missed_tokens", 0))],
+    ]
+    share_of_tax = (percent(big.get("missed_tokens", 0),
+                            small.get("missed_tokens", 0) + big.get("missed_tokens", 0)))
+    unpriced = cold.get("unpriced") or []
+    unpriced_line = (f'<p class="muted">без тарифа и потому не в деньгах: '
+                     f'{html.escape(", ".join(unpriced))}</p>' if unpriced else "")
+    heads, sessions = cold.get("heads", 0), cold.get("sessions", 0)
+    return f"""
+        <section>
+          <h2>Холодный старт <span class="muted">первый запрос сессии против кэша</span></h2>
+          <div class="cards">
+            <div class="card"><div class="k">первых запросов</div><div class="v">{first.get('calls', 0)}</div>
+              <div class="muted">из {cold.get('calls', 0)} запросов в логе, попаданий {first.get('share', 0)}%</div></div>
+            <div class="card"><div class="k">цена холодного старта</div>
+              <div class="v">{first.get('tax_peak', 0):.2f} USD</div>
+              <div class="muted">вне пика {first.get('tax_off_peak', 0):.2f} USD; верхняя граница</div></div>
+            <div class="card"><div class="k">из них перезалив истории</div>
+              <div class="v">{share_of_tax}%</div>
+              <div class="muted">остальное - сама голова</div></div>
+            <div class="card"><div class="k">голова префикса</div>
+              <div class="v">{human(cold.get('prefix_low', 0))}</div>
+              <div class="muted">токенов, нижняя четверть; медиана старта {human(cold.get('prefix_median', 0))}</div></div>
+            <div class="card"><div class="k">голов промпта</div><div class="v">{heads}</div>
+              <div class="muted">на {sessions} сессий: каждая новая голова - холодный старт</div></div>
+          </div>
+          <h3>По номеру запроса в сессии</h3>
+          {rows([["№ запроса", "штук", "вход", "доля кэша", ""]] + number_rows)}
+          <h3>Первый запрос: голова или история</h3>
+          {rows([["причина", "штук", "вход", "доля кэша", "промах, токенов"]] + split_rows)}
+          <p class="muted">порог «большого» первого запроса - {human(cold.get('threshold', 0))} токенов;
+          окно лога: {html.escape(str(cold.get('first_day', '')))} … {html.escape(str(cold.get('last_day', '')))}
+          ({cold.get('window_days', 0)} дн., {cold.get('calls', 0)} запросов)</p>
+          {unpriced_line}
+        </section>"""
+
+
 def render_page(payload: dict, hours: float) -> str:
     hermes, sqz, jev, combined = payload["hermes"], payload["sqz"], payload["jev"], payload["combined"]
     plugin = payload.get("sqz_plugin") or {"available": False}
@@ -203,6 +265,10 @@ def render_page(payload: dict, hours: float) -> str:
     # 1b. Стоимость: тарифы владельца превращают токены в деньги
     if combined.get("prices_configured"):
         sections.append(cost_block(combined, hermes))
+
+    # 1c. Холодный старт: где именно промахи кэша превращаются в деньги.
+    # Показывается даже при отсутствии базы Hermes: лог агента - отдельный источник.
+    sections.append(cold_block(payload.get("cold") or {}))
 
     # 2. Сжатие
     if sqz.get("available"):

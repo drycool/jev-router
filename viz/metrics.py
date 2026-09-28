@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -52,8 +53,20 @@ SQZ_DB = Path(os.getenv("JEV_VIZ_SQZ_DB", "~/.sqz/sessions.db")).expanduser()
 # раздуло, ни того, что 68% сжатий не дали ничего.
 PLUGIN_LOG = Path(os.getenv("JEV_VIZ_SQZ_PLUGIN_LOG",
                             "~/.hermes/logs/sqz_plugin.jsonl")).expanduser()
+# Лог агента: единственное место, где расход виден НА ЗАПРОС, а не на сессию.  В базе
+# `sessions` лежит итог по сессии, `messages.token_count` пуст, `session_model_usage`
+# режет по задачам (title_generation и т.п.).  Поэтому вся арифметика холодных
+# первых запросов считается здесь - из строк вида
+#   `API call #1: model=… in=21779 out=2 total=21781 latency=1.8s cache=1280/21779 (6%)`
+AGENT_LOG = Path(os.getenv("JEV_VIZ_AGENT_LOG", "~/.hermes/logs/agent.log")).expanduser()
 JEV_DIR = Path(os.getenv("JEV_VIZ_JEV_DIR", str(Path(__file__).resolve().parents[1]))).expanduser()
 PRICES_FILE = Path(__file__).resolve().parent / "prices.json"
+
+# Порог «большого» первого запроса.  Голова префикса Hermes - около 21.8 тысяч
+# токенов (системный промпт 23.2 тысячи символов плюс 33 инструмента), поэтому
+# первый запрос заметно выше этой границы несёт в себе не только голову, а
+# перезалив истории сессии при возобновлении или сжатии контекста.
+BIG_FIRST_CALL_TOKENS = 60000
 
 # Тиры, которые означают «база ответила сама, модель не нужна».  Список явный, потому что
 # от него зависит главная цифра отчёта - доля запросов, не потребовавших облака.
@@ -493,8 +506,185 @@ def price_for(prices: dict, model: str) -> dict | None:
     return prices[max(matches, key=len)]
 
 
+_CALL_LINE = re.compile(
+    r"API call #(?P<number>\d+): model=(?P<model>\S+) provider=(?P<provider>\S+) "
+    r"in=(?P<input>\d+) out=(?P<output>\d+) total=(?P<total>\d+) latency=(?P<latency>[\d.]+)s "
+    r"cache=(?P<hit>\d+)/(?P<prompt>\d+) \((?P<share>\d+)%\)")
+_SESSION_STAMP = re.compile(r"\[(?P<day>\d{8})_\d{6}_[0-9a-f]+\]")
+
+
+def agent_calls(path: Path = AGENT_LOG) -> list[dict]:
+    """Расход по каждому запросу к модели - из лога агента.
+
+    Только здесь видно номер запроса внутри сессии, а значит и то, что первый
+    запрос стоит дороже всех остальных вместе.  День берётся из идентификатора
+    сессии в той же строке: у самого лога даты нет, только время.
+    """
+    if not path.exists():
+        return []
+    calls: list[dict] = []
+    with path.open(errors="replace") as handle:
+        for line in handle:
+            found = _CALL_LINE.search(line)
+            if not found:
+                continue
+            stamp = _SESSION_STAMP.search(line)
+            day = stamp.group("day") if stamp else ""
+            calls.append({
+                "number": int(found.group("number")),
+                "model": found.group("model"),
+                "provider": found.group("provider"),
+                "input_tokens": int(found.group("input")),
+                "output_tokens": int(found.group("output")),
+                "cache_read_tokens": int(found.group("hit")),
+                "share": int(found.group("share")),
+                "latency": float(found.group("latency")),
+                # 20260928 -> 2026-09-28, чтобы день сортировался как текст
+                "day": f"{day[:4]}-{day[4:6]}-{day[6:8]}" if len(day) == 8 else "",
+            })
+    return calls
+
+
+def _median(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return float((ordered[middle - 1] + ordered[middle]) / 2)
+
+
+def _oldest_day(hours: float) -> str:
+    return _since(hours).strftime("%Y-%m-%d")
+
+
+def cold_prefix_summary(hours: float = 0.0, path: Path = AGENT_LOG,
+                        prices: dict | None = None,
+                        sessions_path: Path = HERMES_DB) -> dict:
+    """Холодный старт: сколько стоит ПЕРВЫЙ запрос сессии и кто именно его ест.
+
+    Префикс-кэш провайдера байтовый, поэтому первый запрос сессии почти всегда
+    платит полную цену за то, что живёт в начале контекста.  Замер показал две
+    разные причины, и они требуют разных действий:
+
+    * малый первый запрос (меньше порога) - это сама голова: системный промпт,
+      список инструментов, индекс скиллов.  Лечится прогревом головы и тем,
+      чтобы она не менялась между сессиями;
+    * большой первый запрос - это перезалив уже накопленной истории при
+      возобновлении сессии или после сжатия контекста.  Прогревом головы не
+      лечится вовсе.
+
+    Деньги считаются как «сколько те же токены стоили бы из кэша»: это верхняя
+    граница, а не факт - у нового префикса кэша ещё нет и взять его неоткуда.
+    """
+    all_calls = agent_calls(path)
+    oldest = _oldest_day(hours)
+    calls = [call for call in all_calls if hours <= 0 or not call["day"] or call["day"] >= oldest]
+
+    by_number: list[dict] = []
+    for number in range(1, 13):
+        bucket = [call for call in calls if call["number"] == number]
+        if bucket:
+            by_number.append(_bucket_row(str(number), bucket))
+    tail = [call for call in calls if call["number"] > 12]
+    if tail:
+        by_number.append(_bucket_row("13+", tail))
+
+    first = [call for call in calls if call["number"] == 1]
+    small = [call for call in first if call["input_tokens"] < BIG_FIRST_CALL_TOKENS]
+    big = [call for call in first if call["input_tokens"] >= BIG_FIRST_CALL_TOKENS]
+
+    unpriced: set[str] = set()
+    tax_peak = 0.0
+    tax_off_peak = 0.0
+    for call in first:
+        price = price_for(prices or {}, call["model"])
+        if not price:
+            if call["model"]:
+                unpriced.add(call["model"])
+            continue
+        missed = max(0, call["input_tokens"] - call["cache_read_tokens"])
+        tax_peak += missed * (price["input"] - price["cache_read"]) / 1e6
+        off_peak = price.get("off_peak") or price
+        tax_off_peak += missed * (off_peak["input"] - off_peak["cache_read"]) / 1e6
+
+    days = sorted({call["day"] for call in calls if call["day"]})
+    heads, sessions = _prompt_heads(hours, sessions_path)
+
+    return {
+        # available - есть ли лог вообще; calls - сколько запросов попало в окно.
+        # Разделять важно: «нет лога» и «в окне нет запросов» требуют разных действий.
+        "available": bool(all_calls),
+        "path": str(path),
+        "in_window": bool(calls),
+        "calls": len(calls),
+        "window_days": len(days),
+        "first_day": days[0] if days else "",
+        "last_day": days[-1] if days else "",
+        "by_number": by_number,
+        "first_calls": {
+            "calls": len(first),
+            "input_tokens": sum(call["input_tokens"] for call in first),
+            "cache_read_tokens": sum(call["cache_read_tokens"] for call in first),
+            "share": percent(sum(call["cache_read_tokens"] for call in first),
+                             sum(call["input_tokens"] for call in first)),
+            "tax_peak": round(tax_peak, 4),
+            "tax_off_peak": round(tax_off_peak, 4),
+        },
+        "small": _bucket_row("малые (только голова)", small),
+        "big": _bucket_row("большие (перезалив истории)", big),
+        # Размер головы: нижняя четверть малых первых запросов.  Ни медиана, ни
+        # минимум здесь не годятся: медиана вбирает сессии, возобновлённые с
+        # накопленной историей (41 тысяча вместо реальных 21.8), а минимум ловит
+        # сессию с намеренно урезанным набором инструментов (3.9 тысячи).
+        "prefix_low": int(percentile([call["input_tokens"] for call in small], 0.25)),
+        "prefix_median": int(_median([call["input_tokens"] for call in small])),
+        "heads": heads,
+        "sessions": sessions,
+        "unpriced": sorted(unpriced),
+        "threshold": BIG_FIRST_CALL_TOKENS,
+    }
+
+
+def _bucket_row(label: str, calls: Sequence[dict]) -> dict:
+    input_tokens = sum(call["input_tokens"] for call in calls)
+    hit = sum(call["cache_read_tokens"] for call in calls)
+    return {
+        "label": label,
+        "calls": len(calls),
+        "input_tokens": input_tokens,
+        "cache_read_tokens": hit,
+        "missed_tokens": input_tokens - hit,
+        "share": percent(hit, input_tokens),
+    }
+
+
+def _prompt_heads(hours: float, sessions_path: Path) -> tuple[int, int]:
+    """Сколько РАЗНЫХ голов было у сессий в окне: хеш системного промпта.
+
+    Каждая новая голова - это гарантированный холодный первый запрос у всех
+    сессий, которые её используют.  Дата в конце системного промпта делает
+    голову уникальной на сутки, поэтому счётчик растёт.
+    """
+    connection = _connect(sessions_path)
+    if connection is None:
+        return 0, 0
+    try:
+        row = connection.execute(
+            "select count(distinct system_prompt_hash), count(*) from sessions "
+            "where system_prompt_hash is not null and started_at >= ?",
+            (_since(hours).timestamp(),)).fetchone()
+    except sqlite3.Error:
+        return 0, 0
+    finally:
+        connection.close()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
 def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = SQZ_DB,
-              jev_dir: Path = JEV_DIR, plugin_log: Path = PLUGIN_LOG) -> dict:
+              jev_dir: Path = JEV_DIR, plugin_log: Path = PLUGIN_LOG,
+              agent_log: Path = AGENT_LOG) -> dict:
     """Одна страница данных: три источника плюс то, ради чего они вместе.
 
     Главная производная - сопоставление: сколько запросов база закрыла сама и сколько
@@ -506,6 +696,7 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
     plugin = sqz_plugin_summary(hours, plugin_log)
     jev = jev_summary(hours, jev_dir)
     prices = load_prices()
+    cold = cold_prefix_summary(hours, agent_log, prices, hermes_db)
 
     cloud_calls = sum(day["assistant_calls"] for day in hermes.get("per_day", []))
     tokens = {
@@ -549,6 +740,7 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
         "sqz": sqz,
         "sqz_plugin": plugin,
         "jev": jev,
+        "cold": cold,
         "combined": {
             "cloud_calls": cloud_calls,
             "jev_requests": jev.get("requests", 0),
@@ -589,6 +781,18 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
                                           if spent_sessions else None),
             "cost_currency": prices.get("_currency", "USD") if isinstance(prices, dict) else "USD",
             "prices_configured": bool(prices),
+            # Холодный старт: первый запрос сессии - единственный, который платит
+            # полную цену за голову контекста.  Считается по логу агента, потому что
+            # только там виден номер запроса внутри сессии.
+            "cold_calls": cold.get("calls", 0),
+            "cold_first_calls": (cold.get("first_calls") or {}).get("calls", 0),
+            "cold_first_share_percent": (cold.get("first_calls") or {}).get("share", 0),
+            "cold_tax_peak": (cold.get("first_calls") or {}).get("tax_peak", 0),
+            "cold_tax_off_peak": (cold.get("first_calls") or {}).get("tax_off_peak", 0),
+            "cold_prefix_tokens": cold.get("prefix_low", 0),
+            "cold_prefix_median_tokens": cold.get("prefix_median", 0),
+            "prompt_heads": cold.get("heads", 0),
+            "prompt_head_sessions": cold.get("sessions", 0),
         },
         "notes": [
             "Токены считаются по сессиям Hermes (в сообщениях счётчиков нет), поэтому ряд "
@@ -603,5 +807,10 @@ def dashboard(hours: float = 24.0, hermes_db: Path = HERMES_DB, sqz_db: Path = S
             "использование базы.",
             "Стоимость не показывается, пока нет viz/prices.json с тарифами владельца: "
             "цены зависят от тарифа, а выдуманный тариф хуже отсутствующего.",
+            "Холодный старт считается по логу агента (в базе номер запроса внутри сессии "
+            "не хранится), поэтому окно у него - по дням из идентификаторов сессий, и оно "
+            "может быть короче окна страницы: лог ротируется.",
+            "Деньги холодного старта - верхняя граница, а не факт: это стоимость тех же "
+            "токенов по цене кэша. У нового префикса кэша ещё нет, и взять его неоткуда.",
         ],
     }

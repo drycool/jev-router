@@ -105,6 +105,32 @@ def show(payload: dict) -> None:
         if jev["feedback"]:
             print(f"  обратная связь: {jev['feedback']}")
 
+    print("\n── ХОЛОДНЫЙ СТАРТ (первый запрос сессии) ────────────────────────────")
+    cold = payload.get("cold") or {}
+    if not cold.get("available"):
+        print(f"  нет лога {cold.get('path')}")
+    else:
+        first = cold["first_calls"]
+        print(f"  запросов в логе {cold['calls']}, из них первых {first['calls']} "
+              f"(попаданий {first['share']}%); окно {cold['first_day']} … {cold['last_day']} "
+              f"({cold['window_days']} дн.)")
+        print(f"  цена холодного старта: {first['tax_peak']:.2f} USD (пик) … "
+              f"{first['tax_off_peak']:.2f} USD (вне пика) - верхняя граница")
+        print(f"  голова префикса (нижняя четверть): {human_size(cold['prefix_low'])} токенов, "
+              f"медиана холодного старта {human_size(cold['prefix_median'])}")
+        print(f"  голов системного промпта: {cold['heads']} на {cold['sessions']} сессий")
+        print("\n  по номеру запроса в сессии:")
+        for row in cold["by_number"]:
+            print(f"    #{row['label']:>3}  штук {row['calls']:>5}  вход "
+                  f"{human_size(row['input_tokens']):>8}  кэш {row['share']:>5}%")
+        print("\n  первый запрос: голова или история?")
+        for row in (cold["small"], cold["big"]):
+            print(f"    {row['label']:<28} штук {row['calls']:>4}  вход "
+                  f"{human_size(row['input_tokens']):>8}  кэш {row['share']:>5}%  "
+                  f"промах {human_size(row['missed_tokens']):>8}")
+        if cold["unpriced"]:
+            print(f"  без тарифа, в деньги не вошли: {', '.join(cold['unpriced'])}")
+
     print("\n── СВЯЗКА ────────────────────────────────────────────────────────────")
     print(f"  вызовов модели на один запрос к базе: {combined['cloud_calls_per_jev_request']}")
     print(f"  доля запросов, закрытых локально:     {combined['local_share_percent']}%")
