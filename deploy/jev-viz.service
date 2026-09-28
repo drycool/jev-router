@@ -1,0 +1,20 @@
+[Unit]
+Description=Jev + sqz + Hermes: dashboard (read-only observer)
+Documentation=file:/home/dry/Jev/viz/README.md
+# Наблюдатель ничего не требует от наблюдаемого: он поднимается, даже если Jev лежит,
+# и не тянет за собой GPU2.  Порядок запуска намеренно не задан.
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dry/Jev
+ExecStart=/usr/bin/python3 /home/dry/Jev/viz/server.py --port 8035
+# Тот же приём, что у jev.service: у пользовательских юнитов на этой машине журнала нет,
+# и сервис, чей вывод уходит в никуда, неотличим от сломанного.
+StandardOutput=append:/home/dry/Jev/jev_viz.log
+StandardError=append:/home/dry/Jev/jev_viz.log
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
