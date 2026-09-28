@@ -205,7 +205,7 @@ def render_page(payload: dict, hours: float) -> str:
  ul {{ margin:0; padding-left:1.2rem; color:#8b949e; }}
 </style></head><body>
 <h1>Jev + sqz + Hermes: что стало дешевле</h1>
-<div class="muted">окно: последние {hours:g} ч · сформировано {payload['generated_at'][:19]}Z
+<div class="muted">окно: {"всё время" if hours <= 0 else f"последние {hours:g} ч"} · сформировано {payload['generated_at'][:19]}Z
  · запросов к базе {jev.get('requests', 0)}, из них локально {combined['local_share_percent']}%
  · облачных вызовов {combined['cloud_calls']} · кэш {combined['cache_share_percent']}%
  · sqz сэкономил {human(combined['sqz_saved_tokens'])} токенов ({combined['sqz_saving_percent']}%)</div>

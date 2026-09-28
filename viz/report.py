@@ -29,7 +29,8 @@ def human_size(value: int) -> str:
 
 def show(payload: dict) -> None:
     window = payload["window_hours"]
-    print(f"окно: последние {window:g} ч    сформировано {payload['generated_at'][:19]}Z\n")
+    label = "всё время" if window <= 0 else f"последние {window:g} ч"
+    print(f"окно: {label}    сформировано {payload['generated_at'][:19]}Z\n")
 
     hermes, sqz, jev = payload["hermes"], payload["sqz"], payload["jev"]
     combined = payload["combined"]
